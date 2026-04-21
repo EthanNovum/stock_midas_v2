@@ -1,0 +1,41 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@400;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-headline: "Manrope", sans-serif;
+
+  --color-primary: #00343e;
+  --color-primary-container: #004c59;
+  --color-secondary: #4d616c;
+  --color-surface: #f8fafb;
+  --color-surface-bright: #f8fafb;
+  --color-surface-dim: #d8dadb;
+  --color-surface-container-low: #f2f4f5;
+  --color-surface-container-low-dark: #1e2122;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-highest: #eceeef;
+  --color-on-surface: #191c1d;
+  --color-on-surface-variant: #40484c;
+  --color-tertiary-fixed: #a3f69c;
+  --color-on-tertiary-fixed: #00343e;
+  --color-error: #ba1a1a;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+  --color-tertiary-container: #005111;
+  --color-on-tertiary-container: #74c570;
+  --color-outline: #71787d;
+  --color-outline-variant: #c0c7cd;
+}
+
+@layer base {
+  body {
+    @apply bg-surface text-on-surface font-sans antialiased selection:bg-tertiary-fixed/30;
+  }
+}
+
+@layer utilities {
+  .backdrop-blur-xl {
+    backdrop-filter: blur(24px);
+  }
+}
