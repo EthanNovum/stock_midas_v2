@@ -110,7 +110,7 @@ const getSortValue = (stock: ScreeningResult, field: SortField) => {
   if (field === 'price') return stock.price;
   if (field === 'marketCap') return parseMarketCap(stock.marketCap);
   if (field === 'pe') return stock.pe;
-  if (field === 'dividend') return stock.dividend;
+  if (field === 'dividend') return Number(stock.dividend ?? 0);
   return SIGNAL_SORT_VALUE[stock.signal];
 };
 
@@ -642,7 +642,7 @@ export const Screener: React.FC = () => {
                     {stock.pe}
                   </td>
                   <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs">
-                    {stock.dividend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    {Number(stock.dividend ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                 </tr>
               ))}
