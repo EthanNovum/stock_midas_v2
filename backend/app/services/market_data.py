@@ -9,6 +9,15 @@ INDEX_TARGETS = [
 ]
 
 
+def listing_exchange_name(symbol_or_code: str) -> str:
+    plain_code = str(symbol_or_code or "").split(".")[0].strip().zfill(6)
+    if plain_code.startswith(("300", "301")):
+        return "创业板"
+    if plain_code.startswith(("8", "4", "920", "430")):
+        return "北交所"
+    return "沪深"
+
+
 def market_status(now: datetime | None = None) -> dict:
     current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     if current.weekday() >= 5:
@@ -168,7 +177,7 @@ def to_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
     try:
-        text = str(value).replace(",", "").strip()
+        text = str(value).replace(",", "").replace("%", "").strip()
         if text in {"", "-", "nan", "None"}:
             return default
         return round(float(text), 2)

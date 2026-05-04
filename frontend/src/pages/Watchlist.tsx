@@ -1,157 +1,820 @@
-import React from 'react';
-import { 
-  Plus, 
-  MoreVertical,
-  TrendingUp,
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  BarChart3,
+  Check,
+  LineChart,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Search,
+  Tags,
+  Trash2,
   TrendingDown,
-  LayoutGrid,
-  Rows,
-  Building2,
-  CalendarDays
+  TrendingUp,
+  X,
 } from 'lucide-react';
+import { StockKlineChart } from '@/src/components/StockKlineChart';
 import { cn } from '@/src/lib/utils';
+import { StockRef } from '@/src/types';
+
+const DEFAULT_WATCHLIST_ID = 'sector-my-watchlist';
+
+type ChartRange = 'intraday' | '5d' | 'daily' | 'weekly';
 
 interface StockItem {
   id: string;
+  symbol: string;
   name: string;
-  sector: string;
-  price: number;
-  vol: string;
-  pct: number;
+  sector?: string;
+  industry?: string;
+  price?: number | null;
+  vol?: string;
+  pct?: number;
+  groupIds?: string[];
 }
 
-interface SectorGroup {
+interface WatchlistGroup {
+  id: string;
   name: string;
+  groupType?: string;
+  isDefault?: boolean;
   stocks: StockItem[];
 }
 
-const watchListData: SectorGroup[] = [
-  {
-    name: '新能源产业链',
-    stocks: [
-      { id: '300750', name: '宁德时代', sector: '锂电池', price: 182.45, vol: '12.4M', pct: 2.34 },
-      { id: '002594', name: '比亚迪', sector: '新能源车', price: 245.60, vol: '18.2M', pct: 1.12 },
-      { id: '601012', name: '隆基绿能', sector: '光伏设备', price: 23.85, vol: '35.1M', pct: -0.85 },
-    ]
-  },
-  {
-    name: '食品饮料',
-    stocks: [
-      { id: '600519', name: '贵州茅台', sector: '白酒', price: 1658.00, vol: '2.1M', pct: 0.45 },
-    ]
-  },
-  {
-    name: '大金融',
-    stocks: [
-      { id: '600036', name: '招商银行', sector: '股份制银行', price: 32.15, vol: '45.8M', pct: -1.20 },
-    ]
-  }
+interface ChartPoint {
+  date: string;
+  open: number;
+  close: number;
+  high: number;
+  low: number;
+  volume: number;
+  pct?: number;
+}
+
+interface ChartPayload {
+  symbol: string;
+  name: string;
+  range: ChartRange;
+  points: ChartPoint[];
+}
+
+interface StockSearchResult {
+  type: string;
+  id: string;
+  title: string;
+  subtitle?: string;
+  industry?: string;
+  latestPrice?: number | null;
+  latestTradeDate?: string | null;
+}
+
+const CHART_RANGES: Array<{ id: ChartRange; label: string; icon: React.ComponentType<{ size?: number; className?: string }> }> = [
+  { id: 'intraday', label: '分时', icon: LineChart },
+  { id: '5d', label: '5日', icon: LineChart },
+  { id: 'daily', label: '日 K', icon: BarChart3 },
+  { id: 'weekly', label: '周 K', icon: BarChart3 },
 ];
 
-export const Watchlist: React.FC = () => {
+const formatPrice = (value?: number | null) => {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+  return `¥ ${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const formatPercent = (value = 0) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+
+const uniqueStocks = (groups: WatchlistGroup[]) => {
+  const stockMap = new Map<string, StockItem>();
+  groups.forEach((group) => {
+    group.stocks.forEach((stock) => {
+      const existing = stockMap.get(stock.symbol);
+      stockMap.set(stock.symbol, {
+        ...existing,
+        ...stock,
+        groupIds: Array.from(new Set([...(existing?.groupIds ?? []), group.id, ...(stock.groupIds ?? [])])),
+      });
+    });
+  });
+  return Array.from(stockMap.values());
+};
+
+const normalizeSearchInput = (value: string) => value.trim();
+
+interface WatchlistProps {
+  onOpenStockDetail: (stock: StockRef) => void;
+}
+
+export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
+  const [groups, setGroups] = useState<WatchlistGroup[]>([]);
+  const [selectedGroupId, setSelectedGroupId] = useState(DEFAULT_WATCHLIST_ID);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<StockSearchResult[]>([]);
+  const [selectedSearchResult, setSelectedSearchResult] = useState<StockSearchResult | null>(null);
+  const [hasSearched, setHasSearched] = useState(false);
+  const [selectedAddGroupIds, setSelectedAddGroupIds] = useState<string[]>([]);
+  const [newGroupName, setNewGroupName] = useState('');
+  const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [editingGroupName, setEditingGroupName] = useState('');
+  const [selectedStock, setSelectedStock] = useState<StockItem | null>(null);
+  const [chartRange, setChartRange] = useState<ChartRange>('daily');
+  const [chartData, setChartData] = useState<ChartPayload | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSearching, setIsSearching] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isChartLoading, setIsChartLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const defaultGroup = groups.find((group) => group.id === DEFAULT_WATCHLIST_ID) ?? groups[0];
+  const customGroups = groups.filter((group) => group.id !== DEFAULT_WATCHLIST_ID);
+  const activeGroup = groups.find((group) => group.id === selectedGroupId) ?? defaultGroup;
+  const stocks = activeGroup?.id === 'all' ? uniqueStocks(groups) : activeGroup?.stocks ?? [];
+
+  const groupNameById = useMemo(() => {
+    return groups.reduce<Record<string, string>>((acc, group) => {
+      acc[group.id] = group.name;
+      return acc;
+    }, {});
+  }, [groups]);
+
+  const loadGroups = useCallback(async () => {
+    setIsLoading(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch('/api/v1/watchlists?group_by=all');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as { groups?: WatchlistGroup[] };
+      const nextGroups = payload.groups ?? [];
+      setGroups(nextGroups);
+
+      if (!nextGroups.some((group) => group.id === selectedGroupId)) {
+        setSelectedGroupId(nextGroups[0]?.id ?? DEFAULT_WATCHLIST_ID);
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '加载自选失败');
+      setGroups([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [selectedGroupId]);
+
+  useEffect(() => {
+    loadGroups();
+  }, [loadGroups]);
+
+  useEffect(() => {
+    if (!selectedStock) return;
+
+    let isCurrent = true;
+
+    const loadSelectedChart = async () => {
+      setIsChartLoading(true);
+
+      try {
+        const response = await fetch(`/api/v1/watchlists/stocks/${encodeURIComponent(selectedStock.symbol)}/chart?range=${chartRange}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json() as ChartPayload;
+        if (isCurrent) {
+          setChartData(payload);
+        }
+      } catch {
+        if (isCurrent) {
+          setChartData({
+            symbol: selectedStock.symbol,
+            name: selectedStock.name,
+            range: chartRange,
+            points: [],
+          });
+        }
+      } finally {
+        if (isCurrent) {
+          setIsChartLoading(false);
+        }
+      }
+    };
+
+    loadSelectedChart();
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [selectedStock, chartRange]);
+
+  useEffect(() => {
+    if (!selectedStock && stocks.length > 0) {
+      setSelectedStock(stocks[0]);
+    }
+  }, [selectedStock, stocks]);
+
+  useEffect(() => {
+    if (!selectedStock) return;
+
+    const freshStock = stocks.find((stock) => stock.symbol === selectedStock.symbol);
+    if (freshStock && freshStock !== selectedStock) {
+      setSelectedStock(freshStock);
+    }
+  }, [selectedStock, stocks]);
+
+  const selectStock = (stock: StockItem) => {
+    setSelectedStock(stock);
+    setChartData(null);
+  };
+
+  const createGroup = async () => {
+    const name = newGroupName.trim();
+    if (!name) return;
+
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch('/api/v1/watchlists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, groupType: 'custom' }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setNewGroupName('');
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '新增分组失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const saveGroupName = async (groupId: string) => {
+    const name = editingGroupName.trim();
+    if (!name) return;
+
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch(`/api/v1/watchlists/${encodeURIComponent(groupId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setEditingGroupId(null);
+      setEditingGroupName('');
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '修改分组失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const deleteGroup = async (groupId: string) => {
+    if (groupId === DEFAULT_WATCHLIST_ID) return;
+    if (!window.confirm('删除该分组后，分组内股票不会从自选分组中移除。确认删除？')) return;
+
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch(`/api/v1/watchlists/${encodeURIComponent(groupId)}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setSelectedGroupId(DEFAULT_WATCHLIST_ID);
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '删除分组失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const searchStocks = async () => {
+    const query = normalizeSearchInput(searchQuery);
+    if (!query) return;
+
+    setIsSearching(true);
+    setHasSearched(true);
+    setSelectedSearchResult(null);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch(`/api/v1/search?q=${encodeURIComponent(query)}&limit=8`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as { items?: StockSearchResult[] };
+      const stocks = (payload.items ?? []).filter((item) => item.type === 'stock');
+      setSearchResults(stocks);
+      if (stocks.length === 1) {
+        setSelectedSearchResult(stocks[0]);
+      }
+    } catch (error) {
+      setSearchResults([]);
+      setErrorMessage(error instanceof Error ? error.message : '搜索股票失败');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const addStock = async () => {
+    if (!selectedSearchResult) {
+      setErrorMessage('请先搜索并选择要添加的股票');
+      return;
+    }
+
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    const symbol = selectedSearchResult.id;
+    const targetGroupIds = Array.from(new Set([DEFAULT_WATCHLIST_ID, ...selectedAddGroupIds]));
+    try {
+      const responses = await Promise.all(
+        targetGroupIds.map((groupId) => {
+          const url = groupId === DEFAULT_WATCHLIST_ID
+            ? '/api/v1/watchlists/stocks'
+            : `/api/v1/watchlists/${encodeURIComponent(groupId)}/stocks`;
+          return fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ symbol }),
+          });
+        })
+      );
+
+      const failedResponse = responses.find((response) => !response.ok);
+      if (failedResponse) throw new Error(`HTTP ${failedResponse.status}`);
+      setSearchQuery('');
+      setSearchResults([]);
+      setSelectedSearchResult(null);
+      setHasSearched(false);
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '添加股票失败，请确认已同步该股票行情');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const addStockToGroup = async (stock: StockItem, groupId: string) => {
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch(`/api/v1/watchlists/${encodeURIComponent(groupId)}/stocks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: stock.symbol }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '添加股票分组失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const removeStockFromGroup = async (stock: StockItem, groupId: string) => {
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch(
+        `/api/v1/watchlists/${encodeURIComponent(groupId)}/stocks/${encodeURIComponent(stock.symbol)}`,
+        { method: 'DELETE' }
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (activeGroup?.id === groupId && selectedStock?.symbol === stock.symbol) {
+        setSelectedStock(null);
+        setChartData(null);
+      }
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '删除股票分组失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const removeStockFromActiveGroup = async (stock: StockItem) => {
+    if (!activeGroup) return;
+    await removeStockFromGroup(stock, activeGroup.id);
+  };
+
+  const toggleAddGroup = (groupId: string) => {
+    setSelectedAddGroupIds((current) =>
+      current.includes(groupId) ? current.filter((id) => id !== groupId) : [...current, groupId]
+    );
+  };
+
   return (
-    <div className="max-w-7xl mx-auto space-y-10">
-      {/* Page Header */}
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 pb-2 border-b border-surface-container-highest/20">
+    <div className="max-w-7xl mx-auto space-y-8">
+      <div className="flex flex-col xl:flex-row xl:items-end justify-between gap-6 pb-2 border-b border-surface-container-highest/20">
         <div>
-          <div className="flex items-center gap-3 mb-2">
-            <h2 className="text-4xl font-[800] font-headline text-primary tracking-tight">我的自选</h2>
-            <span className="text-[10px] font-black text-on-surface-variant bg-surface-container-low px-2.5 py-1 rounded-full uppercase tracking-widest border border-outline-variant/10">
-              实时数据
+          <div className="flex flex-wrap items-center gap-3 mb-2">
+            <h2 className="text-4xl font-[800] font-headline text-primary">我的自选</h2>
+            <span className="text-xs font-black text-on-surface-variant bg-surface-container-low px-2.5 py-1 rounded-full border border-outline-variant/10">
+              空数据起步
             </span>
           </div>
           <p className="text-sm font-medium text-on-surface-variant max-w-2xl leading-relaxed">
-            监控和管理您的 A 股核心资产池，按行业板块、机构评级或自定义主题进行分类。
+            默认分组为“自选分组”。新增股票会自动加入默认分组，也可以同时勾选多个自定义分组。
           </p>
         </div>
-        
-        <div className="flex items-center gap-1.5 p-1 bg-surface-container-low rounded-full border border-outline-variant/10 shadow-inner">
-          <button type="button" className="flex items-center gap-2 px-6 py-2 rounded-full bg-tertiary-fixed text-primary text-[10px] font-black uppercase tracking-widest shadow-sm">
-            <LayoutGrid size={14} className="stroke-[3px]" />
-            按行业
+
+        <div className="flex flex-col sm:flex-row gap-3">
+          <div className="relative">
+            <label className="flex items-center gap-2 bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-2">
+              <Search size={16} className="text-on-surface-variant" />
+              <input
+                value={searchQuery}
+                onChange={(event) => {
+                  setSearchQuery(event.target.value);
+                  setSelectedSearchResult(null);
+                  setHasSearched(false);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') searchStocks();
+                }}
+                placeholder="输入名称或代码，如 贵州茅台"
+                className="bg-transparent outline-none text-sm font-bold text-primary placeholder:text-on-surface-variant/60 w-56"
+              />
+            </label>
+
+            {(searchResults.length > 0 || hasSearched) && (
+              <div className="absolute right-0 top-12 z-30 w-full sm:w-[360px] rounded-xl border border-outline-variant/20 bg-surface-container-lowest shadow-xl overflow-hidden">
+                {searchResults.length > 0 ? (
+                  searchResults.map((result) => (
+                    <button
+                      key={result.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedSearchResult(result);
+                        setSearchQuery(`${result.title} ${result.id}`);
+                      }}
+                      className={cn(
+                        'w-full px-4 py-3 text-left transition-colors border-b border-outline-variant/10 last:border-b-0',
+                        selectedSearchResult?.id === result.id
+                          ? 'bg-primary text-white'
+                          : 'text-primary hover:bg-surface-container-low'
+                      )}
+                    >
+                      <span className="block text-sm font-black">{result.title}</span>
+                      <span className={cn(
+                        'mt-1 block text-xs font-bold',
+                        selectedSearchResult?.id === result.id ? 'text-white/80' : 'text-on-surface-variant'
+                      )}>
+                        {result.id} · {result.industry ?? result.subtitle ?? '未分类'}
+                        {typeof result.latestPrice === 'number' ? ` · ${formatPrice(result.latestPrice)}` : ''}
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="px-4 py-3 text-sm font-bold text-on-surface-variant">
+                    {isSearching ? '正在搜索股票...' : '没有搜索到可添加的股票'}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={searchStocks}
+            disabled={isSearching || !searchQuery.trim()}
+            className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-surface-container-high text-primary text-sm font-black disabled:opacity-50 transition-all"
+          >
+            <Search size={16} className={cn('stroke-[3px]', isSearching && 'animate-pulse')} />
+            搜索
           </button>
-          <button type="button" className="flex items-center gap-2 px-6 py-2 rounded-full text-on-surface-variant hover:text-primary transition-all text-[10px] font-black uppercase tracking-widest">
-            <Building2 size={14} />
-            按机构
-          </button>
-          <button type="button" className="flex items-center gap-2 px-6 py-2 rounded-full text-on-surface-variant hover:text-primary transition-all text-[10px] font-black uppercase tracking-widest">
-            <Rows size={14} />
-            平铺
+          <button
+            type="button"
+            onClick={addStock}
+            disabled={isSaving || !selectedSearchResult}
+            className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-primary text-white text-sm font-black disabled:opacity-50 transition-all"
+          >
+            <Plus size={16} className="stroke-[3px]" />
+            添加到自选
           </button>
         </div>
       </div>
 
-      {/* Grouped List Content */}
-      <div className="space-y-14">
-        {watchListData.map((group) => (
-          <section key={group.name} className="animate-in slide-in-from-bottom duration-700">
-            <div className="sticky top-16 z-20 bg-surface/90 backdrop-blur-md py-4 mb-6 flex justify-between items-center group cursor-default">
-              <div className="flex items-center gap-4">
-                <div className="h-6 w-1.5 bg-gradient-to-b from-primary to-primary-container rounded-full shadow-[0_0_8px_rgba(0,52,62,0.2)]" />
-                <h3 className="text-2xl font-[800] font-headline text-primary tracking-tight group-hover:translate-x-1 transition-transform">{group.name}</h3>
-                <span className="text-[10px] font-black text-on-surface-variant bg-surface-container-highest px-3 py-1 rounded-full border border-outline-variant/10">
-                  {group.stocks.length} 个标的
-                </span>
-              </div>
-              <button type="button" className="flex items-center gap-2 text-[10px] font-black text-primary hover:underline transition-all">
-                <Plus size={14} className="stroke-[3px]" />
-                添加标的
-              </button>
-            </div>
+      <section className="space-y-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setSelectedGroupId(DEFAULT_WATCHLIST_ID)}
+            className={cn(
+              'inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-black transition-all',
+              selectedGroupId === DEFAULT_WATCHLIST_ID
+                ? 'bg-primary text-white border-primary shadow-sm'
+                : 'bg-surface-container-lowest text-primary border-outline-variant/20 hover:border-primary/40'
+            )}
+          >
+            <Tags size={15} />
+            {groupNameById[DEFAULT_WATCHLIST_ID] ?? '自选分组'}
+          </button>
 
-            <div className="grid grid-cols-1 gap-4">
-              {group.stocks.map((stock) => (
-                <div 
-                  key={stock.id} 
+          {customGroups.map((group) => (
+            <div
+              key={group.id}
+              className={cn(
+                'inline-flex items-center gap-2 rounded-full border px-2 py-1.5 transition-all',
+                selectedGroupId === group.id
+                  ? 'bg-primary text-white border-primary shadow-sm'
+                  : 'bg-surface-container-lowest text-primary border-outline-variant/20 hover:border-primary/40'
+              )}
+            >
+              {editingGroupId === group.id ? (
+                <>
+                  <input
+                    value={editingGroupName}
+                    onChange={(event) => setEditingGroupName(event.target.value)}
+                    className="w-28 bg-transparent outline-none text-sm font-black"
+                    autoFocus
+                  />
+                  <button type="button" onClick={() => saveGroupName(group.id)} aria-label="保存分组名称">
+                    <Check size={15} />
+                  </button>
+                  <button type="button" onClick={() => setEditingGroupId(null)} aria-label="取消修改分组">
+                    <X size={15} />
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button type="button" onClick={() => setSelectedGroupId(group.id)} className="px-2 text-sm font-black">
+                    {group.name}
+                    <span className="ml-2 opacity-70">{group.stocks.length}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingGroupId(group.id);
+                      setEditingGroupName(group.name);
+                    }}
+                    aria-label={`修改 ${group.name}`}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button type="button" onClick={() => deleteGroup(group.id)} aria-label={`删除 ${group.name}`}>
+                    <Trash2 size={14} />
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="flex flex-col lg:flex-row gap-3 lg:items-center justify-between">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-black text-on-surface-variant">加入分组</span>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 text-primary px-3 py-1.5 text-xs font-black">
+              <Check size={13} />
+              {groupNameById[DEFAULT_WATCHLIST_ID] ?? '自选分组'}
+            </span>
+            {customGroups.map((group) => (
+              <button
+                key={group.id}
+                type="button"
+                onClick={() => toggleAddGroup(group.id)}
+                className={cn(
+                  'inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-black transition-all',
+                  selectedAddGroupIds.includes(group.id)
+                    ? 'bg-primary text-white border-primary'
+                    : 'bg-surface-container-lowest text-on-surface-variant border-outline-variant/20 hover:text-primary'
+                )}
+              >
+                {selectedAddGroupIds.includes(group.id) && <Check size={13} />}
+                {group.name}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              value={newGroupName}
+              onChange={(event) => setNewGroupName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') createGroup();
+              }}
+              placeholder="新分组名称"
+              className="h-10 rounded-xl border border-outline-variant/20 bg-surface-container-lowest px-3 text-sm font-bold text-primary outline-none"
+            />
+            <button
+              type="button"
+              onClick={createGroup}
+              disabled={isSaving || !newGroupName.trim()}
+              className="h-10 inline-flex items-center gap-2 rounded-xl bg-surface-container-high text-primary px-4 text-sm font-black disabled:opacity-50"
+            >
+              <Plus size={15} />
+              新增分组
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {errorMessage && (
+        <div className="rounded-xl border border-error/20 bg-error-container/20 px-4 py-3 text-sm font-bold text-error">
+          {errorMessage}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_460px] gap-6">
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-2xl font-[800] font-headline text-primary">{activeGroup?.name ?? '自选分组'}</h3>
+              <p className="text-sm font-bold text-on-surface-variant">{stocks.length} 个标的</p>
+            </div>
+            <button
+              type="button"
+              onClick={loadGroups}
+              className="inline-flex items-center gap-2 rounded-xl bg-surface-container-lowest border border-outline-variant/20 px-3 py-2 text-sm font-black text-primary"
+            >
+              <RefreshCw size={15} className={cn(isLoading && 'animate-spin')} />
+              刷新
+            </button>
+          </div>
+
+          {isLoading && stocks.length === 0 && (
+            <div className="rounded-xl border border-outline-variant/20 bg-surface-container-lowest p-8 text-center text-sm font-bold text-on-surface-variant">
+              正在加载自选分组...
+            </div>
+          )}
+
+          {!isLoading && stocks.length === 0 && (
+            <div className="rounded-xl border border-dashed border-outline-variant/30 bg-surface-container-lowest p-10 text-center">
+              <p className="text-lg font-[800] font-headline text-primary">暂无自选股票</p>
+              <p className="mt-2 text-sm font-medium text-on-surface-variant">
+                输入股票代码添加后，会先进入“自选分组”，也可以同步加入多个自定义分组。
+              </p>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 gap-3">
+            {stocks.map((stock) => (
+              <article
+                key={`${activeGroup?.id}-${stock.symbol}`}
+                onClick={() => selectStock(stock)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    selectStock(stock);
+                  }
+                }}
+                className={cn(
+                  'bg-surface-container-lowest rounded-xl p-5 border transition-all cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-primary/40',
+                  selectedStock?.symbol === stock.symbol
+                    ? 'border-primary shadow-md shadow-primary/5'
+                    : 'border-transparent hover:border-outline-variant/30'
+                )}
+              >
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="flex items-center gap-4 min-w-0">
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onOpenStockDetail({ symbol: stock.symbol, name: stock.name });
+                      }}
+                      className="w-14 h-14 rounded-xl bg-surface-container-low flex items-center justify-center text-primary font-black text-xs font-headline shrink-0 hover:bg-primary hover:text-white transition-all"
+                    >
+                      {stock.id}
+                    </button>
+                    <div className="min-w-0">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          selectStock(stock);
+                        }}
+                        className="font-headline font-[800] text-xl text-primary hover:text-primary-container transition-colors text-left"
+                      >
+                        {stock.name}
+                      </button>
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-black text-on-surface-variant">{stock.symbol}</span>
+                        <span className="text-xs font-bold text-on-surface-variant/70">{stock.industry ?? stock.sector ?? '未分类'}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col md:items-end gap-2">
+                    <div className="font-headline font-[800] text-2xl text-on-surface tabular-nums">{formatPrice(stock.price)}</div>
+                    <div className="flex items-center gap-3">
+                      <div className={cn(
+                        'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-black',
+                        (stock.pct ?? 0) >= 0 ? 'bg-error-container/40 text-error' : 'bg-tertiary-container/10 text-tertiary-container'
+                      )}>
+                        {(stock.pct ?? 0) >= 0 ? <TrendingUp size={15} /> : <TrendingDown size={15} />}
+                        {formatPercent(stock.pct)}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          removeStockFromActiveGroup(stock);
+                        }}
+                        disabled={isSaving}
+                        className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-black text-on-surface-variant hover:bg-surface-container-low hover:text-error disabled:opacity-50"
+                      >
+                        <Trash2 size={14} />
+                        移除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {(stock.groupIds ?? [activeGroup?.id].filter(Boolean) as string[]).map((groupId) => (
+                    <span key={groupId} className="inline-flex items-center gap-1.5 rounded-full bg-surface-container-low px-2.5 py-1 text-xs font-black text-on-surface-variant">
+                      {groupNameById[groupId] ?? groupId}
+                      {groupId !== DEFAULT_WATCHLIST_ID && (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            removeStockFromGroup(stock, groupId);
+                          }}
+                          disabled={isSaving}
+                          className="rounded-full p-0.5 hover:bg-surface-container-high hover:text-error disabled:opacity-50"
+                          aria-label={`从 ${groupNameById[groupId] ?? groupId} 移除 ${stock.name}`}
+                        >
+                          <X size={12} className="stroke-[3px]" />
+                        </button>
+                      )}
+                    </span>
+                  ))}
+                  {customGroups
+                    .filter((group) => !(stock.groupIds ?? []).includes(group.id))
+                    .map((group) => (
+                      <button
+                        key={group.id}
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          addStockToGroup(stock, group.id);
+                        }}
+                        disabled={isSaving}
+                        className="inline-flex items-center gap-1 rounded-full border border-outline-variant/20 bg-surface-container-lowest px-2.5 py-1 text-xs font-black text-primary hover:border-primary/40 disabled:opacity-50"
+                        aria-label={`把 ${stock.name} 加入 ${group.name}`}
+                      >
+                        <Plus size={12} className="stroke-[3px]" />
+                        {group.name}
+                      </button>
+                    ))}
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <aside className="xl:sticky xl:top-24 h-fit rounded-xl bg-surface-container-lowest border border-outline-variant/20 p-5">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-xl font-[800] font-headline text-primary">
+                {selectedStock?.name ?? 'K 线图'}
+              </h3>
+              <p className="mt-1 text-sm font-bold text-on-surface-variant">
+                {selectedStock?.symbol ?? '点击股票名称查看走势'}
+              </p>
+            </div>
+            {isChartLoading && <RefreshCw size={18} className="animate-spin text-primary" />}
+          </div>
+
+          <div className="mt-5 flex flex-wrap gap-2">
+            {CHART_RANGES.map((range) => {
+              const Icon = range.icon;
+              return (
+                <button
+                  key={range.id}
+                  type="button"
+                  onClick={() => setChartRange(range.id)}
                   className={cn(
-                    "group bg-surface-container-lowest rounded-[1.5rem] p-6 flex flex-col sm:flex-row items-center justify-between",
-                    "border border-transparent hover:border-outline-variant/20 hover:shadow-xl hover:shadow-primary/5 transition-all duration-500 cursor-pointer overflow-hidden relative"
+                    'inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-black transition-all',
+                    chartRange === range.id
+                      ? 'bg-primary text-white'
+                      : 'bg-surface-container-low text-on-surface-variant hover:text-primary'
                   )}
                 >
-                  <div className="flex items-center gap-6 w-full sm:w-1/3">
-                    <div className="w-14 h-14 rounded-2xl bg-surface-container-low flex items-center justify-center text-primary font-black text-xs font-headline group-hover:rotate-6 transition-transform">
-                      {stock.id}
-                    </div>
-                    <div>
-                      <h4 className="font-headline font-[800] text-xl text-primary leading-none group-hover:text-primary-container transition-colors mb-2">
-                        {stock.name}
-                      </h4>
-                      <p className="text-[10px] font-black text-on-surface-variant uppercase tracking-[0.2em]">{stock.sector}</p>
-                    </div>
-                  </div>
+                  <Icon size={13} />
+                  {range.label}
+                </button>
+              );
+            })}
+          </div>
 
-                  <div className="w-full sm:w-1/4 mt-4 sm:mt-0 flex flex-col sm:items-end">
-                    <div className="font-headline font-[800] text-2xl text-on-surface tabular-nums">¥ {stock.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <CalendarDays size={12} className="text-on-surface-variant/40" />
-                      <span className="text-[10px] font-bold text-on-surface-variant/60 uppercase tracking-widest font-mono">Vol: {stock.vol}</span>
-                    </div>
-                  </div>
-
-                  <div className="w-full sm:w-1/4 mt-4 sm:mt-0 flex justify-between sm:justify-end items-center gap-6">
-                    <div className={cn(
-                      "inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-black shadow-sm",
-                      // Matching Chinese market standard: RED is UP, GREEN is DOWN
-                      stock.pct >= 0 
-                        ? "bg-error-container/40 text-error" 
-                        : "bg-tertiary-container/10 text-tertiary-container"
-                    )}>
-                      {stock.pct >= 0 ? <TrendingUp size={16} className="stroke-[3px]" /> : <TrendingDown size={16} className="stroke-[3px]" />}
-                      {stock.pct >= 0 ? '+' : ''}{stock.pct.toFixed(2)}%
-                    </div>
-                    
-                    <button type="button" aria-label={`${stock.name} 操作菜单`} className="p-3 text-on-surface-variant hover:text-primary hover:bg-surface-container-low rounded-xl transition-all">
-                      <MoreVertical size={20} />
-                    </button>
-                  </div>
-                  
-                  {/* Subtle hover effect line */}
-                  <div className="absolute bottom-0 left-0 h-1 bg-primary w-0 group-hover:w-full transition-all duration-700" />
-                </div>
-              ))}
-            </div>
-          </section>
-        ))}
+          <div className="mt-5">
+            {chartData && chartData.points.length > 0 ? (
+              <StockKlineChart
+                points={chartData.points}
+                mode={chartRange === 'daily' || chartRange === 'weekly' ? 'kline' : 'line'}
+                heightClassName="h-80"
+                emptyMessage="暂无已同步走势数据"
+              />
+            ) : (
+              <div className="h-72 rounded-xl bg-surface-container-low flex items-center justify-center text-sm font-bold text-on-surface-variant">
+                暂无已同步走势数据
+              </div>
+            )}
+          </div>
+        </aside>
       </div>
     </div>
   );

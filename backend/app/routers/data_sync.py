@@ -30,6 +30,7 @@ def create_job(
 def process_job(job_id: str, payload: DataSyncJobCreate) -> None:
     with connect() as conn:
         try:
+            data_sync.wait_until_resumed(conn, job_id)
             data_sync.mark_running(conn, job_id, "正在更新 AkShare 数据")
             updated_rows, failed_rows, message = akshare_sync.run_sync(
                 conn,
@@ -42,6 +43,8 @@ def process_job(job_id: str, payload: DataSyncJobCreate) -> None:
                     message,
                 ),
             )
+        except data_sync.DataSyncStopped as exc:
+            data_sync.stop_job(conn, job_id, str(exc))
         except Exception as exc:
             data_sync.mark_finished(conn, job_id, 0, 1, f"数据更新失败: {exc}")
         else:
@@ -59,6 +62,30 @@ def latest_job(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     job = data_sync.get_job(conn, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Data sync job not found")
+    return job
+
+
+@router.post("/jobs/{job_id}/pause")
+def pause_job(job_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    job = data_sync.pause_job(conn, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Data sync job not found")
+    return job
+
+
+@router.post("/jobs/{job_id}/resume")
+def resume_job(job_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    job = data_sync.resume_job(conn, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Data sync job not found")
+    return job
+
+
+@router.post("/jobs/{job_id}/stop")
+def stop_job(job_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    job = data_sync.stop_job(conn, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Data sync job not found")
     return job

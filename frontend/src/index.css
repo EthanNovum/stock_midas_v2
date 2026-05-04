@@ -29,6 +29,29 @@
 }
 
 @layer base {
+  :root.dark {
+    --color-primary: #8dccff;
+    --color-primary-container: #173a55;
+    --color-secondary: #9fb1bc;
+    --color-surface: #121516;
+    --color-surface-bright: #2a2d2e;
+    --color-surface-dim: #121516;
+    --color-surface-container-low: #1b1f20;
+    --color-surface-container-lowest: #0d1011;
+    --color-surface-container-highest: #2b2f31;
+    --color-on-surface: #e1e3e4;
+    --color-on-surface-variant: #b9c0c5;
+    --color-tertiary-fixed: #183247;
+    --color-on-tertiary-fixed: #b7e3ff;
+    --color-error: #ffb4ab;
+    --color-error-container: #93000a;
+    --color-on-error-container: #ffdad6;
+    --color-tertiary-container: #74c570;
+    --color-on-tertiary-container: #003910;
+    --color-outline: #8b9297;
+    --color-outline-variant: #3f484d;
+  }
+
   body {
     @apply bg-surface text-on-surface font-sans antialiased selection:bg-tertiary-fixed/30;
   }

@@ -1,6 +1,8 @@
+import json
 import sqlite3
 
 from app.repositories.utils import format_market_cap
+from app.services import market_data
 
 
 SORT_COLUMNS = {
@@ -19,9 +21,11 @@ SORT_COLUMNS = {
 def get_options(conn: sqlite3.Connection) -> dict:
     ownership_rows = conn.execute(
         """
-        SELECT DISTINCT ownership
-        FROM stock_fundamentals
-        WHERE ownership IS NOT NULL AND ownership != ''
+        SELECT DISTINCT COALESCE(NULLIF(o.ownership, ''), f.ownership) AS ownership
+        FROM stock_fundamentals f
+        LEFT JOIN stock_metadata_overrides o ON o.symbol = f.symbol
+        WHERE COALESCE(NULLIF(o.ownership, ''), f.ownership) IS NOT NULL
+            AND COALESCE(NULLIF(o.ownership, ''), f.ownership) != ''
         ORDER BY ownership
         """
     ).fetchall()
@@ -51,13 +55,18 @@ def query(conn: sqlite3.Connection, payload) -> dict:
 
     if payload.ownership:
         placeholders = ",".join("?" for _ in payload.ownership)
-        where.append(f"f.ownership IN ({placeholders})")
+        where.append(f"COALESCE(NULLIF(o.ownership, ''), f.ownership) IN ({placeholders})")
         params.extend(payload.ownership)
 
     if payload.exchanges:
         placeholders = ",".join("?" for _ in payload.exchanges)
         where.append(f"f.exchange IN ({placeholders})")
         params.extend(payload.exchanges)
+
+    if payload.signals:
+        placeholders = ",".join("?" for _ in payload.signals)
+        where.append(f"f.signal IN ({placeholders})")
+        params.extend(getattr(signal, "value", signal) for signal in payload.signals)
 
     filters = payload.filters or {}
     pe_filter = filters.get("pe")
@@ -81,45 +90,66 @@ def query(conn: sqlite3.Connection, payload) -> dict:
         params.append(float(market_cap_filter["value"]))
 
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    latest_prices_sql = """
+        WITH latest_price_dates AS (
+            SELECT symbol, MAX(trade_date) AS trade_date
+            FROM stock_daily_prices
+            GROUP BY symbol
+        ),
+        latest_prices AS (
+            SELECT p.symbol, p.close, p.pct_change, p.trade_date
+            FROM stock_daily_prices p
+            JOIN latest_price_dates l
+              ON l.symbol = p.symbol AND l.trade_date = p.trade_date
+        )
+    """
     total = conn.execute(
-        f"SELECT COUNT(*) FROM stock_fundamentals f {where_sql}",
+        f"""
+        {latest_prices_sql}
+        SELECT COUNT(*)
+        FROM stock_fundamentals f
+        LEFT JOIN stock_metadata_overrides o ON o.symbol = f.symbol
+        JOIN latest_prices p ON p.symbol = f.symbol
+        {where_sql}
+        """,
         params,
     ).fetchone()[0]
     available_total = conn.execute(
-        """
+        f"""
+        {latest_prices_sql}
         SELECT COUNT(*)
         FROM stock_fundamentals f
-        JOIN (
-            SELECT symbol, close, pct_change, MAX(trade_date) AS trade_date
-            FROM stock_daily_prices
-            GROUP BY symbol
-        ) p ON p.symbol = f.symbol
-        """
+        LEFT JOIN stock_metadata_overrides o ON o.symbol = f.symbol
+        JOIN latest_prices p ON p.symbol = f.symbol
+        """,
     ).fetchone()[0]
 
     order_by = build_order_by(payload.sort)
     offset = (payload.page - 1) * payload.page_size
     rows = conn.execute(
         f"""
+        {latest_prices_sql}
         SELECT
             f.symbol,
             f.name,
-            f.sector,
+            f.exchange,
+            f.listing_exchange,
+            COALESCE(NULLIF(o.ownership, ''), f.ownership) AS ownership,
+            COALESCE(NULLIF(o.sector, ''), f.sector) AS sector,
             f.market_cap,
             f.pe_ttm,
             f.dividend_yield,
             f.ma120,
             f.ma120_lower,
             f.ma120_upper,
+            f.revenue_segments_json,
             f.signal,
             p.close AS price,
-            p.pct_change AS change
+            p.pct_change AS change,
+            p.trade_date
         FROM stock_fundamentals f
-        JOIN (
-            SELECT symbol, close, pct_change, MAX(trade_date) AS trade_date
-            FROM stock_daily_prices
-            GROUP BY symbol
-        ) p ON p.symbol = f.symbol
+        LEFT JOIN stock_metadata_overrides o ON o.symbol = f.symbol
+        JOIN latest_prices p ON p.symbol = f.symbol
         {where_sql}
         ORDER BY {order_by}
         LIMIT ? OFFSET ?
@@ -161,13 +191,46 @@ def to_screener_item(row: sqlite3.Row) -> dict:
         "name": row["name"],
         "price": row["price"],
         "change": row["change"],
+        "exchange": row["exchange"] or "",
+        "listingExchange": row["exchange"] or row["listing_exchange"] or market_data.listing_exchange_name(row["symbol"]),
+        "ownership": row["ownership"] or "未知",
+        "tradeDate": row["trade_date"],
         "industry": row["sector"] or "未分类",
         "marketCap": format_market_cap(row["market_cap"]),
         "pe": row["pe_ttm"],
         "dividend": row["dividend_yield"] or 0.0,
+        "revenueSegments": parse_revenue_segments(row["revenue_segments_json"]),
         "initial": initials.get(row["symbol"], row["symbol"][0]),
         "ma120": row["ma120"],
         "ma120Lower": row["ma120_lower"],
         "ma120Upper": row["ma120_upper"],
         "signal": row["signal"],
     }
+
+
+def parse_revenue_segments(value: object) -> list[dict]:
+    try:
+        segments = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(segments, list):
+        return []
+
+    parsed = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        name = str(segment.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            revenue_percent = float(segment.get("revenue_percent") or segment.get("revenuePercent") or 0.0)
+        except (TypeError, ValueError):
+            revenue_percent = 0.0
+        parsed.append(
+            {
+                "name": name,
+                "revenuePercent": revenue_percent,
+            }
+        )
+    return parsed

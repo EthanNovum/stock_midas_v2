@@ -3,6 +3,8 @@ import sqlite3
 
 
 DEFAULT_WATCHLIST_ID = "sector-my-watchlist"
+DEFAULT_WATCHLIST_NAME = "自选分组"
+VALID_CHART_RANGES = {"intraday", "5d", "daily", "weekly"}
 
 
 class WatchlistError(ValueError):
@@ -16,22 +18,40 @@ def list_watchlists(conn: sqlite3.Connection, group_by: str) -> dict:
         return {"groups": [{"id": "flat", "name": "全部自选", "stocks": rows}]}
 
     groups = conn.execute(
-        "SELECT id, name FROM watchlists WHERE group_type=? ORDER BY created_at",
-        (group_by if group_by != "institution" else "sector",),
+        """
+        SELECT id, name, group_type
+        FROM watchlists
+        ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, created_at
+        """,
+        (DEFAULT_WATCHLIST_ID,),
     ).fetchall()
     return {
         "groups": [
-            {"id": group["id"], "name": group["name"], "stocks": stock_rows(conn, group["id"])}
+            {
+                "id": group["id"],
+                "name": group["name"],
+                "groupType": group["group_type"],
+                "isDefault": group["id"] == DEFAULT_WATCHLIST_ID,
+                "stocks": stock_rows(conn, group["id"]),
+            }
             for group in groups
         ]
     }
 
 
 def stock_rows(conn: sqlite3.Connection, watchlist_id: str | None) -> list[dict]:
-    where = "WHERE wi.watchlist_id=?" if watchlist_id else ""
-    params = [watchlist_id] if watchlist_id else []
     rows = conn.execute(
-        f"""
+        """
+        WITH latest AS (
+            SELECT symbol, MAX(trade_date) AS latest_trade_date
+            FROM stock_daily_prices
+            GROUP BY symbol
+        ),
+        memberships AS (
+            SELECT symbol, GROUP_CONCAT(DISTINCT watchlist_id) AS group_ids
+            FROM watchlist_items
+            GROUP BY symbol
+        )
         SELECT
             substr(f.symbol, 1, instr(f.symbol, '.') - 1) AS id,
             f.symbol,
@@ -39,16 +59,30 @@ def stock_rows(conn: sqlite3.Connection, watchlist_id: str | None) -> list[dict]
             f.sector,
             p.close AS price,
             printf('%.1fM', COALESCE(p.volume, 0) / 1000000.0) AS vol,
-            p.pct_change AS pct
+            COALESCE(p.pct_change, 0) AS pct,
+            memberships.group_ids
         FROM watchlist_items wi
         JOIN stock_fundamentals f ON f.symbol = wi.symbol
-        JOIN stock_daily_prices p ON p.symbol = f.symbol
-        {where}
+        LEFT JOIN memberships ON memberships.symbol = f.symbol
+        LEFT JOIN latest ON latest.symbol = f.symbol
+        LEFT JOIN stock_daily_prices p
+            ON p.symbol = latest.symbol
+            AND p.trade_date = latest.latest_trade_date
+        WHERE (? IS NULL OR wi.watchlist_id=?)
+        GROUP BY f.symbol
         ORDER BY f.market_cap DESC
         """,
-        params,
+        (watchlist_id, watchlist_id),
     ).fetchall()
-    return [{**dict(row), "industry": row["sector"], "trend": stock_trend(conn, row["symbol"])} for row in rows]
+    return [
+        {
+            **{key: row[key] for key in row.keys() if key != "group_ids"},
+            "industry": row["sector"],
+            "groupIds": row["group_ids"].split(",") if row["group_ids"] else [],
+            "trend": stock_trend(conn, row["symbol"]),
+        }
+        for row in rows
+    ]
 
 
 def stock_trend(conn: sqlite3.Connection, symbol: str) -> list[float]:
@@ -92,6 +126,8 @@ def update_watchlist(conn: sqlite3.Connection, watchlist_id: str, payload) -> di
 
 def delete_watchlist(conn: sqlite3.Connection, watchlist_id: str) -> None:
     get_watchlist(conn, watchlist_id)
+    if watchlist_id == DEFAULT_WATCHLIST_ID:
+        raise WatchlistError("默认自选分组不能删除")
     conn.execute("DELETE FROM watchlist_items WHERE watchlist_id=?", (watchlist_id,))
     conn.execute("DELETE FROM watchlists WHERE id=?", (watchlist_id,))
     conn.commit()
@@ -130,11 +166,97 @@ def ensure_default_watchlist(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO watchlists (id, name, group_type, created_at)
-        VALUES (?, '我的自选', 'sector', datetime('now'))
+        VALUES (?, ?, 'sector', datetime('now'))
         """,
-        (DEFAULT_WATCHLIST_ID,),
+        (DEFAULT_WATCHLIST_ID, DEFAULT_WATCHLIST_NAME),
+    )
+    conn.execute(
+        """
+        UPDATE watchlists
+        SET name=?
+        WHERE id=? AND name='我的自选'
+        """,
+        (DEFAULT_WATCHLIST_NAME, DEFAULT_WATCHLIST_ID),
     )
     conn.commit()
+
+
+def stock_chart(conn: sqlite3.Connection, symbol: str, range_name: str) -> dict:
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_range = range_name if range_name in VALID_CHART_RANGES else "daily"
+    source_rows = price_rows_for_range(conn, normalized_symbol, normalized_range)
+    points = weekly_points(source_rows) if normalized_range == "weekly" else [dict(row) for row in source_rows]
+
+    stock = conn.execute(
+        "SELECT symbol, name FROM stock_fundamentals WHERE symbol=?",
+        (normalized_symbol,),
+    ).fetchone()
+    return {
+        "symbol": normalized_symbol,
+        "name": stock["name"] if stock else normalized_symbol,
+        "range": normalized_range,
+        "points": points,
+    }
+
+
+def price_rows_for_range(conn: sqlite3.Connection, symbol: str, range_name: str) -> list[sqlite3.Row]:
+    limits = {
+        "intraday": 30,
+        "5d": 5,
+        "daily": 120,
+        "weekly": 260,
+    }
+    rows = conn.execute(
+        """
+        SELECT
+            trade_date AS date,
+            open,
+            close,
+            COALESCE(high, close) AS high,
+            COALESCE(low, close) AS low,
+            COALESCE(volume, 0) AS volume,
+            COALESCE(pct_change, 0) AS pct
+        FROM stock_daily_prices
+        WHERE symbol=?
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        (symbol, limits[range_name]),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def weekly_points(rows: list[sqlite3.Row]) -> list[dict]:
+    weeks: dict[str, dict] = {}
+    for row in rows:
+        year_week = row["date"][:10]
+        week_key = year_week[:4] + "-W" + sqlite_week_number(year_week)
+        point = weeks.setdefault(
+            week_key,
+            {
+                "date": row["date"],
+                "open": row["open"],
+                "close": row["close"],
+                "high": row["high"],
+                "low": row["low"],
+                "volume": 0,
+                "pct": row["pct"],
+            },
+        )
+        point["date"] = row["date"]
+        point["close"] = row["close"]
+        point["high"] = max(point["high"], row["high"])
+        point["low"] = min(point["low"], row["low"])
+        point["volume"] += row["volume"]
+        point["pct"] = row["pct"]
+    return list(weeks.values())
+
+
+def sqlite_week_number(date_text: str) -> str:
+    from datetime import date
+
+    year, month, day = (int(part) for part in date_text.split("-"))
+    return str(date(year, month, day).isocalendar().week).zfill(2)
 
 
 def get_watchlist(conn: sqlite3.Connection, watchlist_id: str) -> sqlite3.Row:
@@ -158,6 +280,12 @@ def normalize_symbol(symbol: str) -> str:
     stripped = symbol.strip().upper()
     if not stripped:
         raise WatchlistError("标的代码不能为空")
+    if len(stripped) == 6 and stripped.isdigit():
+        if stripped.startswith(("8", "4", "920", "430")):
+            return f"{stripped}.BJ"
+        if stripped.startswith("6"):
+            return f"{stripped}.SH"
+        return f"{stripped}.SZ"
     return stripped
 
 

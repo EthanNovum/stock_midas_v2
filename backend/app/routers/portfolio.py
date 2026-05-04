@@ -5,7 +5,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.dependencies import get_conn
 from app.repositories import portfolio
-from app.schemas import TradeCreate, TradeUpdate
+from app.schemas import CashAdjustmentCreate, TradeCreate, TradeUpdate
 
 router = APIRouter(prefix="/portfolio")
 
@@ -28,6 +28,14 @@ def allocation(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
 @router.get("/trades")
 def list_trades(portfolio_id: int = 1, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     return portfolio.list_trades(conn, portfolio_id)
+
+
+@router.post("/cash-adjustments")
+def adjust_cash(payload: CashAdjustmentCreate, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return portfolio.adjust_cash(conn, payload)
+    except portfolio.PortfolioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/trades", status_code=201)

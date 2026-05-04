@@ -38,6 +38,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             market TEXT NOT NULL,
             exchange TEXT,
+            listing_exchange TEXT,
             ownership TEXT,
             sector TEXT,
             market_cap REAL,
@@ -49,6 +50,14 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ma120_lower REAL,
             ma120_upper REAL,
             signal TEXT,
+            revenue_segments_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_metadata_overrides (
+            symbol TEXT PRIMARY KEY,
+            sector TEXT,
+            ownership TEXT,
             updated_at TEXT NOT NULL
         );
 
@@ -126,7 +135,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             side TEXT NOT NULL,
             quantity REAL NOT NULL,
             price REAL NOT NULL,
-            traded_at TEXT NOT NULL
+            traded_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS allocation (
@@ -146,7 +156,20 @@ def create_schema(conn: sqlite3.Connection) -> None:
             institution TEXT NOT NULL,
             report_date TEXT NOT NULL,
             content TEXT NOT NULL,
+            source_url TEXT,
+            source_file_name TEXT,
+            source_file_mime TEXT,
+            source_file_data BLOB,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS report_stocks (
+            id INTEGER PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            name TEXT,
+            verdict TEXT NOT NULL DEFAULT 'flat',
+            UNIQUE(report_id, symbol)
         );
 
         CREATE TABLE IF NOT EXISTS report_klines (
@@ -163,23 +186,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS user_settings (
             id INTEGER PRIMARY KEY,
             theme TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            base_url TEXT,
-            api_key_ciphertext TEXT,
             updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS llm_models (
-            id INTEGER PRIMARY KEY,
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            base_url TEXT,
-            api_key_ciphertext TEXT,
-            is_active INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(provider, model)
         );
 
         CREATE TABLE IF NOT EXISTS data_sync_jobs (
@@ -190,7 +197,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             markets_json TEXT NOT NULL,
             symbols_json TEXT,
             trade_date TEXT,
+            start_date TEXT,
+            end_date TEXT,
             full_refresh INTEGER NOT NULL,
+            full_universe INTEGER NOT NULL DEFAULT 0,
             limit_value INTEGER NOT NULL DEFAULT 300,
             update_mode TEXT NOT NULL DEFAULT 'full',
             total_tasks INTEGER NOT NULL DEFAULT 0,
@@ -214,16 +224,39 @@ def create_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "data_sync_jobs", "limit_value", "INTEGER NOT NULL DEFAULT 300")
     ensure_column(conn, "data_sync_jobs", "update_mode", "TEXT NOT NULL DEFAULT 'full'")
+    ensure_column(conn, "data_sync_jobs", "start_date", "TEXT")
+    ensure_column(conn, "data_sync_jobs", "end_date", "TEXT")
+    ensure_column(conn, "data_sync_jobs", "full_universe", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "data_sync_jobs", "total_tasks", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "data_sync_jobs", "completed_tasks", "INTEGER NOT NULL DEFAULT 0")
-    ensure_column(conn, "user_settings", "base_url", "TEXT")
-    ensure_column(conn, "llm_models", "base_url", "TEXT")
+    ensure_column(conn, "trades", "note", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "stock_fundamentals", "listing_exchange", "TEXT")
+    ensure_column(conn, "stock_fundamentals", "revenue_segments_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "research_reports", "source_url", "TEXT")
+    ensure_column(conn, "research_reports", "source_file_name", "TEXT")
+    ensure_column(conn, "research_reports", "source_file_mime", "TEXT")
+    ensure_column(conn, "research_reports", "source_file_data", "BLOB")
+    ensure_column(conn, "report_stocks", "verdict", "TEXT NOT NULL DEFAULT 'flat'")
+    conn.execute("DROP TABLE IF EXISTS llm_models")
+    backfill_report_stocks(conn)
+    conn.execute("UPDATE stock_fundamentals SET ownership = '民营企业' WHERE ownership = '民企'")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def backfill_report_stocks(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO report_stocks (report_id, symbol, name)
+        SELECT id, ticker, ticker_name
+        FROM research_reports
+        WHERE ticker IS NOT NULL AND ticker != ''
+        """
+    )
 
 
 def seed_database(conn: sqlite3.Connection) -> None:
@@ -238,7 +271,6 @@ def seed_database(conn: sqlite3.Connection) -> None:
         seed_reports(conn, timestamp)
     if not conn.execute("SELECT COUNT(*) FROM user_settings").fetchone()[0]:
         seed_settings(conn, timestamp)
-    seed_llm_models(conn, timestamp)
     if not conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0]:
         seed_notifications(conn, timestamp)
     conn.commit()
@@ -260,7 +292,7 @@ def clean_demo_screener_data(conn: sqlite3.Connection) -> None:
         f"""
         DELETE FROM stock_fundamentals
         WHERE symbol IN ({placeholders})
-            AND ownership IN ('央企', '民企')
+            AND ownership IN ('央企', '民企', '民营企业')
             AND sector IN ('白酒', '锂电池', '新能源车', '股份制银行')
         """,
         demo_symbols,
@@ -301,15 +333,16 @@ def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: st
         conn.execute(
             """
             INSERT INTO stock_fundamentals (
-                symbol, name, market, exchange, ownership, sector, market_cap,
+                symbol, name, market, exchange, listing_exchange, ownership, sector, market_cap,
                 pe_ttm, dividend_yield, pb, roe, ma120, ma120_lower, ma120_upper,
-                signal, updated_at
+                signal, revenue_segments_json, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name=excluded.name,
                 market=excluded.market,
                 exchange=excluded.exchange,
+                listing_exchange=excluded.listing_exchange,
                 ownership=excluded.ownership,
                 sector=excluded.sector,
                 market_cap=excluded.market_cap,
@@ -321,6 +354,7 @@ def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: st
                 ma120_lower=excluded.ma120_lower,
                 ma120_upper=excluded.ma120_upper,
                 signal=excluded.signal,
+                revenue_segments_json=excluded.revenue_segments_json,
                 updated_at=excluded.updated_at
             """,
             (
@@ -328,6 +362,7 @@ def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: st
                 normalized["name"],
                 normalized["market"],
                 normalized["exchange"],
+                normalized["listing_exchange"],
                 normalized["ownership"],
                 normalized["sector"],
                 normalized["market_cap"],
@@ -339,6 +374,7 @@ def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: st
                 ma_fields["ma120_lower"],
                 ma_fields["ma120_upper"],
                 ma_fields["signal"],
+                normalized["revenue_segments_json"],
                 timestamp,
             ),
         )
@@ -374,6 +410,39 @@ def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: st
                 timestamp,
             ),
         )
+        for price_row in normalized.get("daily_prices", []):
+            conn.execute(
+                """
+                INSERT INTO stock_daily_prices (
+                    symbol, trade_date, open, close, high, low, volume, amount,
+                    change, pct_change, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open=excluded.open,
+                    close=excluded.close,
+                    high=excluded.high,
+                    low=excluded.low,
+                    volume=excluded.volume,
+                    amount=excluded.amount,
+                    change=excluded.change,
+                    pct_change=excluded.pct_change,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    normalized["symbol"],
+                    price_row["trade_date"],
+                    price_row["open"],
+                    price_row["close"],
+                    price_row["high"],
+                    price_row["low"],
+                    price_row["volume"],
+                    price_row["amount"],
+                    price_row["pct_change"],
+                    price_row["pct_change"],
+                    timestamp,
+                ),
+            )
         updated += 2
     return updated
 
@@ -402,7 +471,8 @@ def normalize_stock_row(row: tuple) -> dict:
             "name": name,
             "market": market,
             "exchange": exchange,
-            "ownership": ownership,
+            "listing_exchange": listing_exchange_name(symbol),
+            "ownership": normalize_ownership_name(ownership),
             "sector": sector,
             "market_cap": market_cap,
             "pe_ttm": pe_ttm,
@@ -418,9 +488,10 @@ def normalize_stock_row(row: tuple) -> dict:
             "low": round(close * 0.98, 2),
             "volume": 1_000_000,
             "amount": close * 1_000_000,
+            "revenue_segments_json": "[]",
         }
 
-    if len(row) == 21:
+    if len(row) in {21, 22, 23, 24}:
         (
             symbol,
             name,
@@ -443,13 +514,28 @@ def normalize_stock_row(row: tuple) -> dict:
             low,
             volume,
             amount,
+            *extra_values,
         ) = row
+        listing_exchange = listing_exchange_name(symbol)
+        revenue_segments = []
+        daily_prices = []
+        if len(extra_values) == 1:
+            if is_revenue_segments_value(extra_values[0]):
+                revenue_segments = extra_values[0]
+            else:
+                listing_exchange = str(extra_values[0] or listing_exchange)
+        elif len(extra_values) >= 2:
+            listing_exchange = str(extra_values[0] or listing_exchange)
+            revenue_segments = extra_values[1]
+            if len(extra_values) >= 3:
+                daily_prices = extra_values[2] or []
         return {
             "symbol": symbol,
             "name": name,
             "market": market,
             "exchange": exchange,
-            "ownership": ownership,
+            "listing_exchange": listing_exchange,
+            "ownership": normalize_ownership_name(ownership),
             "sector": sector,
             "market_cap": market_cap,
             "pe_ttm": pe_ttm,
@@ -465,42 +551,62 @@ def normalize_stock_row(row: tuple) -> dict:
             "low": low,
             "volume": volume,
             "amount": amount,
+            "revenue_segments_json": normalize_revenue_segments_json(revenue_segments),
+            "daily_prices": daily_prices,
         }
 
     raise ValueError(f"Unsupported stock row width: {len(row)}")
 
 
+def listing_exchange_name(symbol_or_code: str) -> str:
+    plain_code = str(symbol_or_code or "").split(".")[0].strip().zfill(6)
+    if plain_code.startswith(("300", "301")):
+        return "创业板"
+    if plain_code.startswith(("8", "4", "920", "430")):
+        return "北交所"
+    return "沪深"
+
+
+def is_revenue_segments_value(value: object) -> bool:
+    if isinstance(value, list):
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return stripped.startswith("[") or stripped == ""
+
+
+def normalize_ownership_name(value: object) -> str:
+    text = str(value or "").strip()
+    if text == "民企":
+        return "民营企业"
+    return text
+
+
+def normalize_revenue_segments_json(value: object) -> str:
+    if isinstance(value, str):
+        return value or "[]"
+    return json_dump(value if value is not None else [])
+
+
 def seed_portfolio(conn: sqlite3.Connection, timestamp: str) -> None:
-    conn.execute("INSERT OR REPLACE INTO portfolios (id, name, cash, created_at) VALUES (?, ?, ?, ?)", (1, "默认组合", 156000.0, timestamp))
-    holdings = [
-        (1, 1, "AAPL", "苹果公司", 500, 145.2, 173.5, "信息技术"),
-        (2, 1, "MSFT", "微软", 300, 310.0, 335.2, "信息技术"),
-        (3, 1, "TSLA", "特斯拉", 150, 240.5, 212.8, "可选消费"),
-        (4, 1, "NVDA", "英伟达", 100, 280.0, 450.0, "信息技术"),
-    ]
-    conn.executemany(
-        "INSERT OR REPLACE INTO holdings (id, portfolio_id, symbol, name, quantity, cost, price, sector) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        holdings,
-    )
-    allocation = [
-        (1, 1, "信息技术", 45, "#00343e"),
-        (2, 1, "可选消费", 25, "#004c59"),
-        (3, 1, "医疗保健", 15, "#86d2e5"),
-        (4, 1, "现金", 15, "#d0e6f3"),
-    ]
-    conn.executemany(
-        "INSERT OR REPLACE INTO allocation (id, portfolio_id, name, value, color) VALUES (?, ?, ?, ?, ?)",
-        allocation,
-    )
+    conn.execute("INSERT OR REPLACE INTO portfolios (id, name, cash, created_at) VALUES (?, ?, ?, ?)", (1, "默认组合", 0.0, timestamp))
 
 
 def seed_default_watchlist(conn: sqlite3.Connection, timestamp: str) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO watchlists (id, name, group_type, created_at)
-        VALUES ('sector-my-watchlist', '我的自选', 'sector', ?)
+        VALUES ('sector-my-watchlist', '自选分组', 'sector', ?)
         """,
         (timestamp,),
+    )
+    conn.execute(
+        """
+        UPDATE watchlists
+        SET name='自选分组'
+        WHERE id='sector-my-watchlist' AND name='我的自选'
+        """
     )
 
 
@@ -517,6 +623,13 @@ def seed_reports(conn: sqlite3.Connection, timestamp: str) -> None:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [(*report, timestamp) for report in reports],
+    )
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO report_stocks (report_id, symbol, name)
+        VALUES (?, ?, ?)
+        """,
+        [(report_id, ticker, ticker_name) for report_id, _, ticker, ticker_name, *_ in reports],
     )
     kline_rows = [
         ("1", "03-15", 175.2, 180.5, 182.1, 174.8, 12000),
@@ -536,27 +649,10 @@ def seed_reports(conn: sqlite3.Connection, timestamp: str) -> None:
 def seed_settings(conn: sqlite3.Connection, timestamp: str) -> None:
     conn.execute(
         """
-        INSERT OR REPLACE INTO user_settings (id, theme, provider, model, base_url, api_key_ciphertext, updated_at)
-        VALUES (1, 'light', 'openai', 'gpt-4o', NULL, NULL, ?)
+        INSERT OR REPLACE INTO user_settings (id, theme, updated_at)
+        VALUES (1, 'light', ?)
         """,
         (timestamp,),
-    )
-
-
-def seed_llm_models(conn: sqlite3.Connection, timestamp: str) -> None:
-    if conn.execute("SELECT COUNT(*) FROM llm_models").fetchone()[0]:
-        return
-
-    row = conn.execute("SELECT provider, model, base_url FROM user_settings WHERE id=1").fetchone()
-    provider = row["provider"] if row else "openai"
-    model = row["model"] if row else "gpt-4o"
-    base_url = row["base_url"] if row else None
-    conn.execute(
-        """
-        INSERT INTO llm_models (provider, model, base_url, api_key_ciphertext, is_active, created_at, updated_at)
-        VALUES (?, ?, ?, NULL, 1, ?, ?)
-        """,
-        (provider, model, base_url, timestamp, timestamp),
     )
 
 

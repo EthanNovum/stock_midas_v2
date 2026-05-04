@@ -2,9 +2,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import { 
   LayoutDashboard, 
   Search, 
-  PieChart, 
-  Star, 
-  FileText, 
+  PieChart,
+  Star,
+  ChartCandlestick,
+  FileText,
   Settings, 
   LogOut,
   Bell,
@@ -40,6 +41,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTa
     { id: 'screener', label: '选股器', icon: Search },
     { id: 'portfolio', label: '投资组合', icon: PieChart },
     { id: 'watchlist', label: '自选股', icon: Star },
+    { id: 'stockDetail', label: '个股', icon: ChartCandlestick },
     { id: 'reports', label: '研究报告', icon: FileText },
     { id: 'settings', label: '设置', icon: Settings },
   ] as const;
@@ -159,22 +161,26 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTa
         "bg-gradient-to-r from-surface-container-low to-surface",
         isCollapsed ? "w-20" : "w-64"
       )}>
-        <div className={cn("px-4 mb-10 overflow-hidden whitespace-nowrap transition-opacity", isCollapsed ? "opacity-0" : "opacity-100")}>
-          <h2 className="text-xl font-[800] text-primary font-headline">Midas 点金术选股</h2>
-          <p className="text-[10px] text-on-surface-variant font-medium mt-1 uppercase tracking-widest">
-            Terminal V2.5
-          </p>
-        </div>
+        <div className={cn(
+          "mb-10 flex h-12 items-start gap-3 px-4",
+          isCollapsed ? "justify-center px-0" : "justify-between"
+        )}>
+          <div className={cn("min-w-0 overflow-hidden whitespace-nowrap transition-all duration-300", isCollapsed ? "w-0 opacity-0" : "w-44 opacity-100")}>
+            <h2 className="text-xl font-[800] text-primary font-headline">Midas选股</h2>
+            <p className="text-[10px] text-on-surface-variant font-medium mt-1 uppercase tracking-widest">
+              Terminal V2.5
+            </p>
+          </div>
 
-        {/* Collapse Toggle */}
-        <button 
-          type="button"
-          aria-label={isCollapsed ? "展开侧边栏" : "收起侧边栏"}
-          onClick={() => setIsCollapsed(!isCollapsed)}
-          className="absolute -right-3 top-20 w-6 h-6 bg-primary text-surface rounded-full flex items-center justify-center shadow-lg hover:scale-110 active:scale-95 transition-all z-50 border-2 border-surface"
-        >
-          {isCollapsed ? <ChevronRight size={14} strokeWidth={3} /> : <ChevronLeft size={14} strokeWidth={3} />}
-        </button>
+          <button
+            type="button"
+            aria-label={isCollapsed ? "展开侧边栏" : "收起侧边栏"}
+            onClick={() => setIsCollapsed(!isCollapsed)}
+            className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl border border-outline-variant/10 bg-primary text-surface shadow-sm transition-all hover:scale-105 active:scale-95"
+          >
+            {isCollapsed ? <ChevronRight size={18} strokeWidth={3} /> : <ChevronLeft size={18} strokeWidth={3} />}
+          </button>
+        </div>
 
         <ul className="flex flex-col gap-2 font-headline font-semibold text-sm">
           {navItems.map((item) => (
@@ -218,15 +224,6 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTa
         {/* Header */}
         <header className="sticky top-0 z-40 bg-surface/80 backdrop-blur-xl flex justify-between items-center px-8 h-16 w-full shadow-[0_24px_48px_rgba(25,28,29,0.04)]">
           <div className="flex items-center gap-8">
-            <div className="flex items-center w-80 bg-surface-container-highest rounded-full px-4 py-2 hover:bg-surface-container-highest/80 transition-colors">
-              <Search className="text-on-surface-variant mr-3" size={18} />
-              <input 
-                type="text" 
-                placeholder="搜索代码、研报..." 
-                className="bg-transparent border-none outline-none text-sm w-full font-sans text-on-surface placeholder:text-outline"
-              />
-            </div>
-            
             {/* Update Notification */}
             <div className="hidden md:flex items-center gap-2 text-[10px] font-black text-on-surface-variant uppercase tracking-widest bg-surface-container-low px-4 py-1.5 rounded-full border border-outline-variant/10">
               <Clock size={12} className="text-primary" />
@@ -235,14 +232,6 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTa
           </div>
 
           <div className="flex items-center gap-4">
-            <button
-              type="button"
-              aria-label="查看通知"
-              className="p-2 rounded-full hover:bg-surface-container-highest transition-colors relative"
-            >
-              <Bell size={20} className="text-primary" />
-              <span className="absolute top-2 right-2 w-2 h-2 bg-error rounded-full border-2 border-surface" />
-            </button>
             <button
               type="button"
               aria-label="打开用户菜单"

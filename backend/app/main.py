@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import runtime_config
 from app.database import init_database
 from app.routers import (
     data_sync,
@@ -14,12 +13,12 @@ from app.routers import (
     screener,
     search,
     settings,
+    stocks,
     watchlists,
 )
 
 
 def create_app() -> FastAPI:
-    runtime_config.reset_runtime_state()
     init_database()
     app = FastAPI(title="Midas Stock Backend", version="0.1.0")
     app.add_middleware(
@@ -40,6 +39,7 @@ def create_app() -> FastAPI:
         portfolio.router,
         reports.router,
         settings.router,
+        stocks.router,
         data_sync.router,
         notifications.router,
     ]

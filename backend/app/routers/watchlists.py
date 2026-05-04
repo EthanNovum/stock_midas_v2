@@ -62,3 +62,11 @@ def delete_stock(watchlist_id: str, symbol: str, conn: sqlite3.Connection = Depe
     except watchlists.WatchlistError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/stocks/{symbol}/chart")
+def stock_chart(symbol: str, range: str = "daily", conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return watchlists.stock_chart(conn, symbol, range)
+    except watchlists.WatchlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

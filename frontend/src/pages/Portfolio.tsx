@@ -11,7 +11,9 @@ import {
   Trash2,
   X,
   Save,
-  Search
+  Search,
+  MinusCircle,
+  Wallet
 } from 'lucide-react';
 import {
   PieChart as RPieChart,
@@ -20,8 +22,10 @@ import {
   ResponsiveContainer
 } from 'recharts';
 import { cn } from '@/src/lib/utils';
+import { StockRef } from '@/src/types';
 
-type TradeSide = 'buy' | 'sell' | 'dividend';
+type TradeSide = 'buy' | 'sell' | 'dividend' | 'deposit' | 'withdraw';
+type CashAdjustmentSide = 'deposit' | 'withdraw';
 
 interface PortfolioSummary {
   portfolioId: number;
@@ -59,6 +63,7 @@ interface TradeItem {
   price: number;
   totalAmount: number;
   tradedAt: string;
+  note: string;
 }
 
 interface TradeFormState {
@@ -67,6 +72,14 @@ interface TradeFormState {
   quantity: string;
   price: string;
   tradedAt: string;
+  note: string;
+}
+
+interface CashAdjustmentFormState {
+  side: CashAdjustmentSide;
+  amount: string;
+  tradedAt: string;
+  note: string;
 }
 
 interface SearchResultItem {
@@ -101,6 +114,14 @@ const createEmptyTradeForm = (): TradeFormState => ({
   quantity: '',
   price: '',
   tradedAt: getTodayDateValue(),
+  note: '',
+});
+
+const createCashAdjustmentForm = (side: CashAdjustmentSide): CashAdjustmentFormState => ({
+  side,
+  amount: '',
+  tradedAt: getTodayDateValue(),
+  note: '',
 });
 
 const formatCurrency = (value: number) => `¥${value.toLocaleString('zh-CN', {
@@ -153,25 +174,43 @@ const formatTradeDate = (value: string) => {
 const getTradeSideLabel = (side: TradeSide) => {
   if (side === 'buy') return '买入';
   if (side === 'sell') return '卖出';
-  return '分红';
+  if (side === 'dividend') return '分红';
+  if (side === 'deposit') return '入金';
+  return '出金';
 };
+
+const isCashTradeSide = (side: TradeSide) => side === 'deposit' || side === 'withdraw';
+
+const getTradeSymbolLabel = (trade: TradeItem) => (
+  isCashTradeSide(trade.side) ? '现金' : trade.symbol
+);
 
 const toPriceInputValue = (value?: number | null) => (
   typeof value === 'number' && Number.isFinite(value) && value > 0 ? String(value) : ''
 );
 
-export const Portfolio: React.FC = () => {
+const normalizeSymbolForCompare = (value: string) => value.trim().toUpperCase().split('.')[0];
+
+interface PortfolioProps {
+  onOpenStockDetail: (stock: StockRef) => void;
+}
+
+export const Portfolio: React.FC<PortfolioProps> = ({ onOpenStockDetail }) => {
   const [summary, setSummary] = useState<PortfolioSummary>(EMPTY_SUMMARY);
   const [holdings, setHoldings] = useState<HoldingItem[]>([]);
   const [allocationData, setAllocationData] = useState<AllocationItem[]>([]);
   const [trades, setTrades] = useState<TradeItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSavingTrade, setIsSavingTrade] = useState(false);
+  const [isSavingCashAdjustment, setIsSavingCashAdjustment] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [tradeMessage, setTradeMessage] = useState<string | null>(null);
+  const [cashAdjustmentMessage, setCashAdjustmentMessage] = useState<string | null>(null);
   const [isTradeDialogOpen, setIsTradeDialogOpen] = useState(false);
+  const [isCashAdjustmentDialogOpen, setIsCashAdjustmentDialogOpen] = useState(false);
   const [editingTrade, setEditingTrade] = useState<TradeItem | null>(null);
   const [tradeForm, setTradeForm] = useState<TradeFormState>(createEmptyTradeForm);
+  const [cashAdjustmentForm, setCashAdjustmentForm] = useState<CashAdjustmentFormState>(() => createCashAdjustmentForm('deposit'));
   const [stockSearchResults, setStockSearchResults] = useState<SearchResultItem[]>([]);
   const [isSearchingStocks, setIsSearchingStocks] = useState(false);
   const [isTradePriceDirty, setIsTradePriceDirty] = useState(false);
@@ -233,7 +272,7 @@ export const Portfolio: React.FC = () => {
 
   useEffect(() => {
     const keyword = tradeForm.symbol.trim();
-    if (!isTradeDialogOpen || keyword.length < 1) {
+    if (!isTradeDialogOpen || isCashTradeSide(tradeForm.side) || keyword.length < 1) {
       setStockSearchResults([]);
       setIsSearchingStocks(false);
       return;
@@ -243,7 +282,7 @@ export const Portfolio: React.FC = () => {
     const timer = window.setTimeout(async () => {
       setIsSearchingStocks(true);
       try {
-        const response = await fetch(`/api/v1/search?q=${encodeURIComponent(keyword)}&limit=8`, {
+        const response = await fetch(`/api/v1/search?q=${encodeURIComponent(keyword)}`, {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -253,7 +292,11 @@ export const Portfolio: React.FC = () => {
         const stockResults = (payload.items ?? []).filter((item) => item.type === 'stock');
         setStockSearchResults(stockResults);
 
-        const exactMatch = stockResults.find((item) => item.id.toUpperCase() === keyword.toUpperCase());
+        const normalizedKeyword = normalizeSymbolForCompare(keyword);
+        const exactMatch = stockResults.find((item) => (
+          item.id.toUpperCase() === keyword.toUpperCase()
+            || normalizeSymbolForCompare(item.id) === normalizedKeyword
+        ));
         const latestPrice = toPriceInputValue(exactMatch?.latestPrice);
         if (latestPrice && !isTradePriceDirty) {
           setTradeForm((form) => ({ ...form, price: latestPrice }));
@@ -273,7 +316,7 @@ export const Portfolio: React.FC = () => {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [isTradeDialogOpen, isTradePriceDirty, tradeForm.symbol]);
+  }, [isTradeDialogOpen, isTradePriceDirty, tradeForm.side, tradeForm.symbol]);
 
   const openCreateTradeDialog = () => {
     setEditingTrade(null);
@@ -284,13 +327,15 @@ export const Portfolio: React.FC = () => {
   };
 
   const openEditTradeDialog = (trade: TradeItem) => {
+    const isCashTrade = isCashTradeSide(trade.side);
     setEditingTrade(trade);
     setTradeForm({
-      symbol: trade.symbol,
+      symbol: isCashTrade ? '' : trade.symbol,
       side: trade.side,
       quantity: String(trade.quantity),
-      price: String(trade.price),
+      price: isCashTrade ? '1' : String(trade.price),
       tradedAt: toDateInputValue(trade.tradedAt),
+      note: trade.note ?? '',
     });
     setTradeMessage(null);
     setIsTradePriceDirty(true);
@@ -305,6 +350,58 @@ export const Portfolio: React.FC = () => {
     setIsTradePriceDirty(false);
   };
 
+  const openCashAdjustmentDialog = (side: CashAdjustmentSide) => {
+    setCashAdjustmentForm(createCashAdjustmentForm(side));
+    setCashAdjustmentMessage(null);
+    setIsCashAdjustmentDialogOpen(true);
+  };
+
+  const closeCashAdjustmentDialog = () => {
+    if (isSavingCashAdjustment) return;
+    setIsCashAdjustmentDialogOpen(false);
+    setCashAdjustmentForm(createCashAdjustmentForm('deposit'));
+  };
+
+  const submitCashAdjustment = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsSavingCashAdjustment(true);
+    setCashAdjustmentMessage(null);
+
+    const amount = Number(cashAdjustmentForm.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setCashAdjustmentMessage('请填写有效金额。');
+      setIsSavingCashAdjustment(false);
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/v1/portfolio/cash-adjustments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          portfolioId: summary.portfolioId || 1,
+          side: cashAdjustmentForm.side,
+          amount,
+          tradedAt: cashAdjustmentForm.tradedAt || undefined,
+          note: cashAdjustmentForm.note.trim(),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response));
+      }
+
+      setCashAdjustmentMessage(cashAdjustmentForm.side === 'deposit' ? '入金已完成。' : '出金已完成。');
+      setIsCashAdjustmentDialogOpen(false);
+      setCashAdjustmentForm(createCashAdjustmentForm('deposit'));
+      await loadPortfolio();
+    } catch (error) {
+      setCashAdjustmentMessage(error instanceof Error ? error.message : '现金调整失败');
+    } finally {
+      setIsSavingCashAdjustment(false);
+    }
+  };
+
   const submitTrade = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setIsSavingTrade(true);
@@ -312,9 +409,11 @@ export const Portfolio: React.FC = () => {
 
     const quantity = Number(tradeForm.quantity);
     const price = Number(tradeForm.price);
-    const symbol = tradeForm.symbol.trim().toUpperCase();
+    const isCashTrade = isCashTradeSide(tradeForm.side);
+    const symbol = isCashTrade ? 'CASH' : tradeForm.symbol.trim().toUpperCase();
+    const effectivePrice = isCashTrade ? 1 : price;
 
-    if (!symbol || !Number.isFinite(quantity) || !Number.isFinite(price) || quantity <= 0 || price <= 0) {
+    if (!symbol || !Number.isFinite(quantity) || !Number.isFinite(effectivePrice) || quantity <= 0 || effectivePrice <= 0) {
       setTradeMessage('请填写有效的证券代码、数量和价格。');
       setIsSavingTrade(false);
       return;
@@ -325,8 +424,9 @@ export const Portfolio: React.FC = () => {
       symbol,
       side: tradeForm.side,
       quantity,
-      price,
+      price: effectivePrice,
       tradedAt: tradeForm.tradedAt || undefined,
+      note: tradeForm.note.trim(),
     };
 
     try {
@@ -357,7 +457,7 @@ export const Portfolio: React.FC = () => {
   };
 
   const deleteTrade = async (trade: TradeItem) => {
-    const confirmed = window.confirm(`删除 ${trade.symbol} ${getTradeSideLabel(trade.side)}记录？`);
+    const confirmed = window.confirm(`删除 ${getTradeSymbolLabel(trade)} ${getTradeSideLabel(trade.side)}记录？`);
     if (!confirmed) return;
 
     setTradeMessage(null);
@@ -390,6 +490,22 @@ export const Portfolio: React.FC = () => {
         <div className="flex flex-wrap gap-3">
           <button
             type="button"
+            onClick={() => openCashAdjustmentDialog('deposit')}
+            className="bg-surface-container-highest text-primary px-5 py-2.5 rounded-xl font-headline font-bold text-sm hover:bg-surface-dim transition-colors flex items-center gap-2"
+          >
+            <Wallet size={18} />
+            入金
+          </button>
+          <button
+            type="button"
+            onClick={() => openCashAdjustmentDialog('withdraw')}
+            className="bg-surface-container-highest text-primary px-5 py-2.5 rounded-xl font-headline font-bold text-sm hover:bg-surface-dim transition-colors flex items-center gap-2"
+          >
+            <MinusCircle size={18} />
+            出金
+          </button>
+          <button
+            type="button"
             onClick={downloadReport}
             className="bg-transparent border border-outline-variant/30 text-primary px-5 py-2.5 rounded-xl font-headline font-bold text-sm hover:bg-surface-container-low transition-colors flex items-center gap-2"
           >
@@ -415,6 +531,17 @@ export const Portfolio: React.FC = () => {
             : "border-primary/20 bg-primary/5 text-primary"
         )}>
           {errorMessage ? `投资组合数据加载失败: ${errorMessage}` : tradeMessage}
+        </div>
+      )}
+
+      {cashAdjustmentMessage && !isCashAdjustmentDialogOpen && (
+        <div className={cn(
+          "rounded-2xl border px-6 py-4 text-sm font-bold",
+          cashAdjustmentMessage.includes('失败') || cashAdjustmentMessage.includes('不足') || cashAdjustmentMessage.includes('有效')
+            ? "border-tertiary-container/20 bg-tertiary-container/10 text-tertiary-container"
+            : "border-primary/20 bg-primary/5 text-primary"
+        )}>
+          {cashAdjustmentMessage}
         </div>
       )}
 
@@ -483,8 +610,8 @@ export const Portfolio: React.FC = () => {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        <div className="lg:col-span-8 bg-surface-container-lowest rounded-[2rem] p-8 shadow-sm border border-outline-variant/10">
-          <div className="flex justify-between items-center mb-8">
+        <div className="lg:col-span-8 bg-surface-container-lowest rounded-[2rem] p-5 md:p-6 shadow-sm border border-outline-variant/10">
+          <div className="flex justify-between items-center mb-4">
             <h4 className="font-headline text-xl font-[800] text-primary tracking-tight">持仓明细</h4>
             <div className="flex gap-2">
               <button type="button" aria-label="筛选持仓" className="p-2 text-on-surface-variant hover:text-primary transition-all rounded-lg">
@@ -497,14 +624,21 @@ export const Portfolio: React.FC = () => {
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse min-w-[720px]">
+            <table className="w-full table-fixed text-left border-collapse min-w-[560px]">
+              <colgroup>
+                <col className="w-[26%]" />
+                <col className="w-[16%]" />
+                <col className="w-[18%]" />
+                <col className="w-[16%]" />
+                <col className="w-[24%]" />
+              </colgroup>
               <thead>
                 <tr className="border-b border-surface-container-highest">
-                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4">代码 / 名称</th>
-                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">持仓数量</th>
-                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">平均成本</th>
-                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">当前价</th>
-                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">总收益</th>
+                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-3 pr-2">代码 / 名称</th>
+                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-3 px-1 text-right">持仓数量</th>
+                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-3 px-1 text-right">平均成本</th>
+                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-3 px-1 text-right">当前价</th>
+                  <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-3 pl-1 text-right">总收益</th>
                 </tr>
               </thead>
               <tbody className="divide-y-0 text-sm">
@@ -517,16 +651,22 @@ export const Portfolio: React.FC = () => {
                 )}
                 {holdings.map((stock) => (
                   <tr key={stock.symbol} className="border-b border-surface-container-highest/60 hover:bg-surface-container-low transition-colors group">
-                    <td className="py-5">
-                      <div className="flex flex-col">
-                        <span className="font-bold text-primary text-base leading-none mb-1">{stock.symbol}</span>
-                        <span className="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest">{stock.name}</span>
+                    <td className="py-4 pr-2">
+                      <div className="flex min-w-0 flex-col">
+                        <button
+                          type="button"
+                          onClick={() => onOpenStockDetail({ symbol: stock.symbol, name: stock.name })}
+                          className="truncate whitespace-nowrap font-bold text-primary text-base leading-none mb-1 text-left hover:text-primary-container transition-colors"
+                        >
+                          {stock.symbol}
+                        </button>
+                        <span className="truncate whitespace-nowrap text-[10px] font-bold text-on-surface-variant uppercase tracking-widest">{stock.name}</span>
                       </div>
                     </td>
-                    <td className="py-5 text-right font-bold text-primary tabular-nums">{stock.quantity.toLocaleString('zh-CN')}</td>
-                    <td className="py-5 text-right font-mono text-on-surface-variant text-xs tabular-nums">{formatCurrency(stock.cost)}</td>
-                    <td className="py-5 text-right font-mono font-bold text-primary text-xs tabular-nums">{formatCurrency(stock.price)}</td>
-                    <td className="py-5 text-right">
+                    <td className="py-4 px-1 text-right font-bold text-primary tabular-nums">{stock.quantity.toLocaleString('zh-CN')}</td>
+                    <td className="py-4 px-1 text-right font-mono text-on-surface-variant text-xs tabular-nums">{formatCurrency(stock.cost)}</td>
+                    <td className="py-4 px-1 text-right font-mono font-bold text-primary text-xs tabular-nums">{formatCurrency(stock.price)}</td>
+                    <td className="py-4 pl-1 text-right">
                       <div className="flex flex-col items-end">
                         <span className={cn(
                           "font-bold font-mono tracking-tight text-sm",
@@ -610,7 +750,7 @@ export const Portfolio: React.FC = () => {
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse min-w-[760px]">
+          <table className="w-full text-left border-collapse min-w-[900px]">
             <thead>
               <tr className="border-b border-surface-container-highest">
                 <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4">时间</th>
@@ -619,13 +759,14 @@ export const Portfolio: React.FC = () => {
                 <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">数量</th>
                 <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">价格</th>
                 <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">成交额</th>
+                <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4">笔记</th>
                 <th className="font-headline text-[10px] font-black uppercase tracking-[0.15em] text-on-surface-variant pb-4 text-right">操作</th>
               </tr>
             </thead>
             <tbody>
               {!isLoading && trades.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-8 text-center text-sm font-bold text-on-surface-variant">
+                  <td colSpan={8} className="py-8 text-center text-sm font-bold text-on-surface-variant">
                     暂无交易记录。
                   </td>
                 </tr>
@@ -633,7 +774,7 @@ export const Portfolio: React.FC = () => {
               {trades.map((trade) => (
                 <tr key={trade.id} className="border-b border-surface-container-highest/60 hover:bg-surface-container-low transition-colors">
                   <td className="py-4 text-xs font-bold text-on-surface-variant">{formatTradeDate(trade.tradedAt)}</td>
-                  <td className="py-4 font-bold text-primary">{trade.symbol}</td>
+                  <td className="py-4 font-bold text-primary">{getTradeSymbolLabel(trade)}</td>
                   <td className="py-4">
                     <span className={cn(
                       "inline-flex items-center rounded-md px-2 py-1 text-[10px] font-black",
@@ -641,14 +782,32 @@ export const Portfolio: React.FC = () => {
                         ? "bg-error-container/30 text-error"
                         : trade.side === 'sell'
                           ? "bg-tertiary-container/10 text-tertiary-container"
-                          : "bg-primary/10 text-primary"
+                          : trade.side === 'withdraw'
+                            ? "bg-tertiary-container/10 text-tertiary-container"
+                            : "bg-primary/10 text-primary"
                     )}>
                       {getTradeSideLabel(trade.side)}
                     </span>
                   </td>
-                  <td className="py-4 text-right font-mono text-sm font-bold tabular-nums">{trade.quantity.toLocaleString('zh-CN')}</td>
-                  <td className="py-4 text-right font-mono text-sm tabular-nums">{formatCurrency(trade.price)}</td>
+                  <td className="py-4 text-right font-mono text-sm font-bold tabular-nums">
+                    {isCashTradeSide(trade.side) ? '-' : trade.quantity.toLocaleString('zh-CN')}
+                  </td>
+                  <td className="py-4 text-right font-mono text-sm tabular-nums">
+                    {isCashTradeSide(trade.side) ? '-' : formatCurrency(trade.price)}
+                  </td>
                   <td className="py-4 text-right font-mono text-sm font-bold tabular-nums">{formatCurrency(trade.totalAmount)}</td>
+                  <td className="py-4 text-right">
+                    {trade.note ? (
+                      <div className="group relative inline-flex items-center">
+                        <Info size={16} className="text-on-surface-variant" />
+                        <div className="pointer-events-none absolute right-0 top-full z-20 mt-2 hidden w-64 rounded-lg border border-outline-variant/20 bg-surface px-3 py-2 text-left text-xs font-bold text-on-surface-variant shadow-xl group-hover:block">
+                          {trade.note}
+                        </div>
+                      </div>
+                    ) : (
+                      <span className="text-xs font-bold text-on-surface-variant">-</span>
+                    )}
+                  </td>
                   <td className="py-4">
                     <div className="flex justify-end gap-2">
                       <button
@@ -678,6 +837,92 @@ export const Portfolio: React.FC = () => {
         </div>
       </div>
 
+      {isCashAdjustmentDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-primary/30 px-4 py-8 backdrop-blur-sm">
+          <form
+            onSubmit={submitCashAdjustment}
+            className="w-full max-w-md bg-surface rounded-2xl border border-outline-variant/20 shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-outline-variant/20 px-6 py-5">
+              <h3 className="font-headline text-xl font-[800] text-primary">
+                {cashAdjustmentForm.side === 'deposit' ? '入金' : '出金'}
+              </h3>
+              <button
+                type="button"
+                onClick={closeCashAdjustmentDialog}
+                aria-label="关闭"
+                className="rounded-lg p-2 text-on-surface-variant hover:bg-surface-container-low hover:text-primary transition-colors"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-5 px-6 py-6">
+              {cashAdjustmentMessage && (
+                <div className="rounded-xl border border-tertiary-container/20 bg-tertiary-container/10 px-4 py-3 text-xs font-bold text-tertiary-container">
+                  {cashAdjustmentMessage}
+                </div>
+              )}
+
+              <label className="block">
+                <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">金额</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={cashAdjustmentForm.amount}
+                  onChange={(event) => setCashAdjustmentForm((form) => ({ ...form, amount: event.target.value }))}
+                  className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 font-mono text-sm font-bold text-primary outline-none focus:border-primary"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">日期</span>
+                <input
+                  type="date"
+                  value={cashAdjustmentForm.tradedAt}
+                  onChange={(event) => setCashAdjustmentForm((form) => ({ ...form, tradedAt: event.target.value }))}
+                  className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 text-sm font-bold text-primary outline-none focus:border-primary"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">笔记</span>
+                <textarea
+                  value={cashAdjustmentForm.note}
+                  onChange={(event) => setCashAdjustmentForm((form) => ({ ...form, note: event.target.value }))}
+                  rows={3}
+                  placeholder={cashAdjustmentForm.side === 'deposit' ? '记录资金来源' : '记录出金用途'}
+                  className="w-full resize-none rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 text-sm font-bold text-primary outline-none focus:border-primary"
+                />
+              </label>
+
+              <div className="rounded-xl bg-surface-container-low px-4 py-3 text-xs font-bold text-on-surface-variant">
+                当前可用现金 {formatCurrency(summary.cash)}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 border-t border-outline-variant/20 px-6 py-5">
+              <button
+                type="button"
+                onClick={closeCashAdjustmentDialog}
+                className="rounded-xl px-5 py-2.5 text-sm font-bold text-on-surface-variant hover:bg-surface-container-low transition-colors"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={isSavingCashAdjustment}
+                className="rounded-xl bg-primary px-5 py-2.5 text-sm font-bold text-surface hover:opacity-90 disabled:opacity-50 transition-colors flex items-center gap-2"
+              >
+                <Save size={16} />
+                {isSavingCashAdjustment ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {isTradeDialogOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-primary/30 px-4 py-8 backdrop-blur-sm">
           <form
@@ -705,54 +950,56 @@ export const Portfolio: React.FC = () => {
                 </div>
               )}
 
-              <div className="relative">
-                <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">证券代码</span>
+              {!isCashTradeSide(tradeForm.side) && (
                 <div className="relative">
-                  <Search size={16} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-on-surface-variant" />
-                  <input
-                    value={tradeForm.symbol}
-                    onChange={(event) => setTradeForm((form) => ({ ...form, symbol: event.target.value }))}
-                    placeholder="输入证券名称或代码搜索"
-                    className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low py-3 pl-11 pr-4 font-mono text-sm font-bold text-primary outline-none focus:border-primary"
-                  />
-                </div>
-                {(isSearchingStocks || stockSearchResults.length > 0) && (
-                  <div className="absolute left-0 right-0 top-full z-10 mt-2 overflow-hidden rounded-xl border border-outline-variant/20 bg-surface shadow-xl">
-                    {isSearchingStocks && (
-                      <div className="px-4 py-3 text-xs font-bold text-on-surface-variant">搜索中...</div>
-                    )}
-                    {!isSearchingStocks && stockSearchResults.map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => {
-                          const latestPrice = toPriceInputValue(item.latestPrice);
-                          setTradeForm((form) => ({
-                            ...form,
-                            symbol: item.id,
-                            price: latestPrice && !isTradePriceDirty ? latestPrice : form.price,
-                          }));
-                          setStockSearchResults([]);
-                        }}
-                        className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left hover:bg-surface-container-low"
-                      >
-                        <span className="min-w-0">
-                          <span className="block truncate text-sm font-bold text-primary">{item.title}</span>
-                          <span className="block truncate text-xs font-bold text-on-surface-variant">{item.subtitle}</span>
-                        </span>
-                        <span className="flex-shrink-0 text-right">
-                          <span className="block font-mono text-xs font-black text-primary">{item.id}</span>
-                          {toPriceInputValue(item.latestPrice) && (
-                            <span className="mt-1 block font-mono text-[10px] font-bold text-on-surface-variant">
-                              {formatCurrency(item.latestPrice ?? 0)}
-                            </span>
-                          )}
-                        </span>
-                      </button>
-                    ))}
+                  <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">证券代码</span>
+                  <div className="relative">
+                    <Search size={16} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-on-surface-variant" />
+                    <input
+                      value={tradeForm.symbol}
+                      onChange={(event) => setTradeForm((form) => ({ ...form, symbol: event.target.value }))}
+                      placeholder="输入证券名称或代码搜索"
+                      className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low py-3 pl-11 pr-4 font-mono text-sm font-bold text-primary outline-none focus:border-primary"
+                    />
                   </div>
-                )}
-              </div>
+                  {(isSearchingStocks || stockSearchResults.length > 0) && (
+                    <div className="absolute left-0 right-0 top-full z-10 mt-2 overflow-hidden rounded-xl border border-outline-variant/20 bg-surface shadow-xl">
+                      {isSearchingStocks && (
+                        <div className="px-4 py-3 text-xs font-bold text-on-surface-variant">搜索中...</div>
+                      )}
+                      {!isSearchingStocks && stockSearchResults.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            const latestPrice = toPriceInputValue(item.latestPrice);
+                            setTradeForm((form) => ({
+                              ...form,
+                              symbol: item.id,
+                              price: latestPrice && !isTradePriceDirty ? latestPrice : form.price,
+                            }));
+                            setStockSearchResults([]);
+                          }}
+                          className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left hover:bg-surface-container-low"
+                        >
+                          <span className="min-w-0">
+                            <span className="block truncate text-sm font-bold text-primary">{item.title}</span>
+                            <span className="block truncate text-xs font-bold text-on-surface-variant">{item.subtitle}</span>
+                          </span>
+                          <span className="flex-shrink-0 text-right">
+                            <span className="block font-mono text-xs font-black text-primary">{item.id}</span>
+                            {toPriceInputValue(item.latestPrice) && (
+                              <span className="mt-1 block font-mono text-[10px] font-bold text-on-surface-variant">
+                                {formatCurrency(item.latestPrice ?? 0)}
+                              </span>
+                            )}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-4">
                 <label className="block">
@@ -765,6 +1012,8 @@ export const Portfolio: React.FC = () => {
                     <option value="buy">买入</option>
                     <option value="sell">卖出</option>
                     <option value="dividend">分红</option>
+                    <option value="deposit">入金</option>
+                    <option value="withdraw">出金</option>
                   </select>
                 </label>
                 <label className="block">
@@ -780,31 +1029,50 @@ export const Portfolio: React.FC = () => {
 
               <div className="grid grid-cols-2 gap-4">
                 <label className="block">
-                  <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">数量</span>
+                  <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">
+                    {isCashTradeSide(tradeForm.side) ? '金额' : '数量'}
+                  </span>
                   <input
                     type="number"
                     min="0"
-                    step="0.0001"
+                    step={isCashTradeSide(tradeForm.side) ? '0.01' : '100'}
                     value={tradeForm.quantity}
                     onChange={(event) => setTradeForm((form) => ({ ...form, quantity: event.target.value }))}
                     className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 font-mono text-sm font-bold text-primary outline-none focus:border-primary"
                   />
                 </label>
-                <label className="block">
-                  <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">价格</span>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.0001"
-                    value={tradeForm.price}
-                    onChange={(event) => {
-                      setIsTradePriceDirty(true);
-                      setTradeForm((form) => ({ ...form, price: event.target.value }));
-                    }}
-                    className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 font-mono text-sm font-bold text-primary outline-none focus:border-primary"
-                  />
-                </label>
+                {!isCashTradeSide(tradeForm.side) ? (
+                  <label className="block">
+                    <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">价格</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      value={tradeForm.price}
+                      onChange={(event) => {
+                        setIsTradePriceDirty(true);
+                        setTradeForm((form) => ({ ...form, price: event.target.value }));
+                      }}
+                      className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 font-mono text-sm font-bold text-primary outline-none focus:border-primary"
+                    />
+                  </label>
+                ) : (
+                  <div className="rounded-xl bg-surface-container-low px-4 py-3 text-xs font-bold text-on-surface-variant self-end">
+                    当前可用现金 {formatCurrency(summary.cash)}
+                  </div>
+                )}
               </div>
+
+              <label className="block">
+                <span className="mb-2 block text-xs font-black uppercase tracking-widest text-on-surface-variant">笔记</span>
+                <textarea
+                  value={tradeForm.note}
+                  onChange={(event) => setTradeForm((form) => ({ ...form, note: event.target.value }))}
+                  rows={3}
+                  placeholder={tradeForm.side === 'sell' ? '记录卖出原因' : isCashTradeSide(tradeForm.side) ? '记录资金变动原因' : '记录买入原因'}
+                  className="w-full resize-none rounded-xl border border-outline-variant/30 bg-surface-container-low px-4 py-3 text-sm font-bold text-primary outline-none focus:border-primary"
+                />
+              </label>
             </div>
 
             <div className="flex items-center justify-end gap-3 border-t border-outline-variant/20 px-6 py-5">

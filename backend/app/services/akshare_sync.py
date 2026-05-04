@@ -3,9 +3,19 @@ import sqlite3
 from datetime import date, timedelta
 from typing import Any, Iterable
 
+import pandas as pd
+
 from app.database import upsert_stocks
 from app.signals import calculate_ma120_fields
 from app.timeutils import now_iso
+
+
+SW_FIRST_INDUSTRY_BY_CODE_PREFIX = {
+    "33": "家用电器",
+    "34": "食品饮料",
+    "48": "银行",
+    "49": "非银金融",
+}
 
 
 def run_sync(conn: sqlite3.Connection, request, progress_callback=None) -> tuple[int, int, str]:
@@ -40,6 +50,10 @@ def fetch_akshare_rows(request, progress_callback=None) -> Iterable[tuple]:
         )
 
     selected = select_spot_rows(spot, request)
+    sw_industry_lookup = build_sw_industry_lookup(
+        ak,
+        [normalize_symbol(str(item.get("代码", "")).strip()) for _, item in selected.iterrows() if str(item.get("代码", "")).strip()],
+    )
     rows = []
     history_errors = 0
     total = len(selected.index)
@@ -50,7 +64,7 @@ def fetch_akshare_rows(request, progress_callback=None) -> Iterable[tuple]:
             continue
 
         try:
-            row = convert_spot_row(item, request, ak)
+            row = convert_spot_row(item, request, ak, sw_industry_lookup)
         except Exception:
             history_errors += 1
             notify_progress(progress_callback, index, total, f"正在全量更新 {index}/{total}")
@@ -72,6 +86,10 @@ def fetch_akshare_rows(request, progress_callback=None) -> Iterable[tuple]:
 
 def fetch_rows_from_code_names(ak: Any, request, cause: Exception, progress_callback=None) -> list[tuple]:
     selected = select_code_name_rows(fetch_code_name_rows(ak, request), request)
+    sw_industry_lookup = build_sw_industry_lookup(
+        ak,
+        [normalize_symbol(str(item["code"]).strip().zfill(6)) for item in selected if str(item["code"]).strip()],
+    )
     rows = []
     row_errors = 0
     total = len(selected)
@@ -81,7 +99,7 @@ def fetch_rows_from_code_names(ak: Any, request, cause: Exception, progress_call
         if not code:
             continue
         try:
-            rows.append(convert_code_name_row(item, request, ak))
+            rows.append(convert_code_name_row(item, request, ak, sw_industry_lookup))
         except Exception:
             row_errors += 1
         notify_progress(progress_callback, index, total, f"正在全量更新 {index}/{total}")
@@ -136,6 +154,8 @@ def select_spot_rows(spot, request):
 
 
 def get_sync_limit(request=None) -> int:
+    if request is not None and getattr(request, "full_universe", False):
+        return 10000
     if request is not None and getattr(request, "limit", None):
         return request.limit
     try:
@@ -144,11 +164,11 @@ def get_sync_limit(request=None) -> int:
         return 300
 
 
-def convert_spot_row(item, request, ak) -> tuple:
+def convert_spot_row(item, request, ak, sw_industry_lookup: dict[str, str] | None = None) -> tuple:
     code = str(item.get("代码", "")).strip()
     symbol = normalize_symbol(code)
     name = str(item.get("名称", code))
-    company_metadata = fetch_company_metadata(ak, code)
+    company_metadata = enrich_company_metadata(ak, code, fetch_company_metadata(ak, code), sw_industry_lookup)
     price = to_float(item.get("最新价"))
     pct_change = to_float(item.get("涨跌幅"))
     market_cap = to_float(item.get("总市值")) / 100000000
@@ -176,8 +196,21 @@ def convert_spot_row(item, request, ak) -> tuple:
         raise RuntimeError(f"{symbol} 收盘价为空")
 
     latest = hist.tail(1).iloc[0]
-    trade_date = str(request.trade_date or latest.get("日期") or date.today())
+    trade_date = latest_date_str(latest.get("日期"), request)
+    if is_history_range_requested(request):
+        price = to_float(latest.get("收盘"), default=price)
+        open_price = to_float(latest.get("开盘"), default=price)
+        high = to_float(latest.get("最高"), default=max(price, open_price))
+        low = to_float(latest.get("最低"), default=min(price, open_price))
+        volume = int(to_float(latest.get("成交量"), default=volume))
+        amount = to_float(latest.get("成交额"), default=amount)
+        if len(hist.index) >= 2:
+            previous_close = to_float(hist.tail(2).iloc[0].get("收盘"), default=price)
+            pct_change = compute_pct_change(price, previous_close, latest.get("涨跌幅"))
     ma120 = round(float(closes.mean()), 2)
+    if dividend <= 0:
+        dividend = fetch_dividend_yield(ak, code, price, trade_date)
+    revenue_segments = fetch_revenue_segments(ak, code)
 
     return (
         symbol,
@@ -201,14 +234,22 @@ def convert_spot_row(item, request, ak) -> tuple:
         low,
         volume,
         amount,
+        listing_exchange_name(code),
+        revenue_segments,
+        history_price_rows(symbol, hist, request),
     )
 
 
-def convert_code_name_row(item: dict[str, str], request, ak) -> tuple:
+def convert_code_name_row(
+    item: dict[str, str],
+    request,
+    ak,
+    sw_industry_lookup: dict[str, str] | None = None,
+) -> tuple:
     code = item["code"]
     symbol = normalize_symbol(code)
     name = item["name"]
-    company_metadata = fetch_company_metadata(ak, code)
+    company_metadata = enrich_company_metadata(ak, code, fetch_company_metadata(ak, code), sw_industry_lookup)
     hist = fetch_history(ak, code, request)
     if hist is None or hist.empty or "收盘" not in hist.columns:
         raise RuntimeError(f"{symbol} 日线为空")
@@ -234,6 +275,11 @@ def convert_code_name_row(item: dict[str, str], request, ak) -> tuple:
     volume = int(to_float(latest.get("成交量"), default=0))
     amount = to_float(latest.get("成交额"))
     ma120 = round(float(closes.mean()), 2)
+    dividend = metrics.get("dividend", 0.0)
+    trade_date = latest_date_str(latest.get("日期"), request)
+    if to_float(dividend) <= 0:
+        dividend = fetch_dividend_yield(ak, code, close, trade_date)
+    revenue_segments = fetch_revenue_segments(ak, code)
 
     return (
         symbol,
@@ -241,23 +287,170 @@ def convert_code_name_row(item: dict[str, str], request, ak) -> tuple:
         "A",
         company_metadata["exchange"],
         company_metadata["ownership"],
-        metrics.get("sector") or company_metadata["sector"],
+        company_metadata["sector"] or metrics.get("sector"),
         metrics.get("market_cap", 0.0),
         metrics.get("pe", 0.0),
-        metrics.get("dividend", 0.0),
+        dividend,
         metrics.get("pb", 0.0),
         0.0,
         close,
         pct_change,
         ma120,
         (metrics.get("name") or name)[:1].upper(),
-        latest_date_str(latest.get("日期"), request),
+        trade_date,
         open_price,
         high,
         low,
         volume,
         amount,
+        listing_exchange_name(code),
+        revenue_segments,
+        history_price_rows(symbol, hist, request),
     )
+
+
+def enrich_company_metadata(
+    ak: Any,
+    code: str,
+    company_metadata: dict[str, str],
+    sw_industry_lookup: dict[str, str] | None = None,
+) -> dict[str, str]:
+    symbol = normalize_symbol(code)
+    sw_industry = (sw_industry_lookup or {}).get(symbol, "未知")
+    if sw_industry and sw_industry != "未知":
+        company_metadata["sector"] = sw_industry
+
+    if company_metadata.get("ownership") == "未知":
+        company_metadata["ownership"] = infer_ownership_from_shareholders(ak, code)
+
+    return company_metadata
+
+
+def infer_ownership_from_shareholders(ak: Any, code: str) -> str:
+    try:
+        frame = ak.stock_main_stock_holder(stock=code)
+    except Exception:
+        return "未知"
+    if frame is None or frame.empty or "股东名称" not in frame.columns:
+        return "未知"
+
+    holder_names = " ".join(
+        str(name)
+        for name in frame["股东名称"].head(10)
+        if "香港中央结算" not in str(name) and "HKSCC" not in str(name)
+    )
+    return classify_ownership_from_text(holder_names)
+
+
+def classify_ownership_from_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "未知"
+    if any(keyword in text for keyword in ("美的控股", "何享健", "方洪波", "中国平安保险", "民营", "私营")):
+        return "民营企业"
+    if any(keyword in text for keyword in ("省国有", "省属", "市属", "地方国资", "人民政府国有资产监督管理委员会", "市投资控股")):
+        return "地方国企"
+    if any(keyword in text for keyword in ("国务院", "中央国资", "招商局", "中国远洋", "中远")):
+        return "央企"
+    return normalize_company_ownership(text, text)
+
+
+def build_sw_industry_lookup(ak: Any, symbols: list[str]) -> dict[str, str]:
+    targets = {symbol.upper(): strip_symbol(symbol).zfill(6) for symbol in symbols}
+    lookup = {symbol: "未知" for symbol in targets}
+    if not targets:
+        return lookup
+
+    try:
+        history = ak.stock_industry_clf_hist_sw()
+    except Exception:
+        return lookup
+    if history is None or history.empty or not {"symbol", "industry_code", "start_date"}.issubset(set(history.columns)):
+        return lookup
+
+    history = history.copy()
+    history["symbol"] = history["symbol"].astype(str).str.zfill(6)
+    history["start_date"] = pd.to_datetime(history["start_date"], errors="coerce")
+    for symbol, code in targets.items():
+        stock_history = history[history["symbol"] == code].sort_values("start_date")
+        if stock_history.empty:
+            continue
+        industry_code = str(stock_history.iloc[-1].get("industry_code") or "").strip()
+        lookup[symbol] = SW_FIRST_INDUSTRY_BY_CODE_PREFIX.get(industry_code[:2], "未知")
+    return lookup
+
+
+def fetch_revenue_segments(ak: Any, code: str) -> list[dict[str, float | str]]:
+    try:
+        frame = ak.stock_zygc_em(symbol=market_prefixed_code(strip_symbol(code).zfill(6)).upper())
+    except Exception:
+        return []
+    return extract_top_revenue_segments(frame)
+
+
+def extract_top_revenue_segments(frame: pd.DataFrame, top: int = 3) -> list[dict[str, float | str]]:
+    if frame is None or frame.empty:
+        return []
+
+    required = {"报告日期", "分类类型", "主营构成", "主营收入", "收入比例"}
+    if not required.issubset(set(frame.columns)):
+        return []
+
+    rows = frame.copy()
+    rows["报告日期"] = rows["报告日期"].astype(str)
+    latest_report_date = rows["报告日期"].max()
+    rows = rows[rows["报告日期"] == latest_report_date]
+
+    product_rows = rows[rows["分类类型"].astype(str).str.contains("产品", na=False)]
+    if not product_rows.empty:
+        rows = product_rows
+
+    rows = rows[~rows["主营构成"].astype(str).str.contains("其他|补充|合计", na=False)]
+    rows = rows.assign(
+        主营收入=pd.to_numeric(rows["主营收入"], errors="coerce"),
+        收入比例=pd.to_numeric(rows["收入比例"], errors="coerce"),
+    )
+    rows = rows.dropna(subset=["主营构成", "主营收入", "收入比例"])
+    rows = rows[rows["主营收入"] > 0].sort_values("主营收入", ascending=False).head(top)
+
+    segments: list[dict[str, float | str]] = []
+    for _, row in rows.iterrows():
+        ratio = float(row["收入比例"])
+        percent = ratio * 100 if abs(ratio) <= 1 else ratio
+        segments.append({"name": str(row["主营构成"]).strip(), "revenue_percent": round(percent, 2)})
+    return segments
+
+
+def fetch_dividend_yield(ak: Any, code: str, close: float, trade_date: str) -> float:
+    try:
+        frame = ak.stock_dividend_cninfo(symbol=code)
+    except Exception:
+        return 0.0
+    return compute_dividend_yield_from_cninfo(frame, close, trade_date)
+
+
+def compute_dividend_yield_from_cninfo(frame: pd.DataFrame, close: float, trade_date: str) -> float:
+    if frame is None or frame.empty or close <= 0 or "派息比例" not in frame.columns:
+        return 0.0
+
+    rows = frame.copy()
+    rows["派息比例"] = pd.to_numeric(rows["派息比例"], errors="coerce")
+    date_column = "除权日" if "除权日" in rows.columns else "派息日" if "派息日" in rows.columns else None
+    if date_column is None:
+        return 0.0
+
+    rows[date_column] = pd.to_datetime(rows[date_column], errors="coerce")
+    end = pd.to_datetime(trade_date, errors="coerce")
+    if pd.isna(end):
+        end = pd.Timestamp(date.today())
+    start = end - pd.Timedelta(days=365)
+    rows = rows[(rows[date_column] <= end) & (rows[date_column] >= start)]
+    dividend_per_ten_shares = rows["派息比例"].dropna().sum()
+    if dividend_per_ten_shares <= 0:
+        return 0.0
+
+    dividend_per_share = float(dividend_per_ten_shares) / 10
+    return round(dividend_per_share / close * 100, 2)
 
 
 def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, progress_callback=None) -> int:
@@ -288,6 +481,7 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
 
         pct_change = compute_pct_change(close, previous_close, latest.get("涨跌幅"))
         ma_fields = calculate_ma120_fields(close, to_float(stock["ma120"]))
+        price_rows = history_price_rows(stock["symbol"], hist, request)
         conn.execute(
             """
             UPDATE stock_fundamentals
@@ -334,7 +528,40 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
                 timestamp,
             ),
         )
-        updated += 2
+        for price_row in price_rows:
+            conn.execute(
+                """
+                INSERT INTO stock_daily_prices (
+                    symbol, trade_date, open, close, high, low, volume, amount,
+                    change, pct_change, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open=excluded.open,
+                    close=excluded.close,
+                    high=excluded.high,
+                    low=excluded.low,
+                    volume=excluded.volume,
+                    amount=excluded.amount,
+                    change=excluded.change,
+                    pct_change=excluded.pct_change,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    stock["symbol"],
+                    price_row["trade_date"],
+                    price_row["open"],
+                    price_row["close"],
+                    price_row["high"],
+                    price_row["low"],
+                    price_row["volume"],
+                    price_row["amount"],
+                    price_row["pct_change"],
+                    price_row["pct_change"],
+                    timestamp,
+                ),
+            )
+        updated += 1 + max(1, len(price_rows))
         notify_progress(progress_callback, index, total, f"正在更新现价 {index}/{total}")
 
     if updated == 0:
@@ -361,7 +588,7 @@ def get_price_update_targets(conn: sqlite3.Connection, request) -> list[sqlite3.
         ORDER BY market_cap DESC, symbol ASC
         LIMIT ?
         """,
-        [*params, request.limit],
+        [*params, get_sync_limit(request)],
     ).fetchall()
     return list(rows)
 
@@ -427,11 +654,11 @@ def normalize_company_ownership(classification: object, controller: object) -> s
     if any(keyword in text for keyword in ("省属", "市属", "地方国资", "人民政府国有资产监督管理委员会", "国资控股")):
         return "地方国企"
     if any(keyword in text for keyword in ("民营", "私营")):
-        return "民企"
+        return "民营企业"
     if "国有资产监督管理委员会" in text or "财政厅" in text or "财政局" in text:
         return "地方国企"
     if looks_like_private_controller(text):
-        return "民企"
+        return "民营企业"
     return "未知"
 
 
@@ -522,8 +749,7 @@ def fetch_history(ak, code: str, request):
 
 
 def fetch_history_eastmoney(ak, code: str, request):
-    end = request.trade_date or date.today()
-    start = end - timedelta(days=260)
+    start, end = history_fetch_bounds(request)
     return ak.stock_zh_a_hist(
         symbol=code,
         period="daily",
@@ -535,8 +761,7 @@ def fetch_history_eastmoney(ak, code: str, request):
 
 
 def fetch_history_tx(ak, code: str, request):
-    end = request.trade_date or date.today()
-    start = end - timedelta(days=260)
+    start, end = history_fetch_bounds(request)
     return ak.stock_zh_a_hist_tx(
         symbol=market_prefixed_code(code),
         start_date=start.strftime("%Y%m%d"),
@@ -547,8 +772,7 @@ def fetch_history_tx(ak, code: str, request):
 
 
 def fetch_history_sina(ak, code: str, request):
-    end = request.trade_date or date.today()
-    start = end - timedelta(days=260)
+    start, end = history_fetch_bounds(request)
     return ak.stock_zh_a_daily(
         symbol=market_prefixed_code(code),
         start_date=start.strftime("%Y%m%d"),
@@ -587,6 +811,68 @@ def normalize_history_frame(hist):
     return normalized
 
 
+def history_fetch_bounds(request) -> tuple[date, date]:
+    end = getattr(request, "end_date", None) or getattr(request, "trade_date", None) or date.today()
+    requested_start = getattr(request, "start_date", None)
+    ma_start = end - timedelta(days=260)
+    start = min(requested_start, ma_start) if requested_start else ma_start
+    return start, end
+
+
+def is_history_range_requested(request) -> bool:
+    return bool(getattr(request, "start_date", None) or getattr(request, "end_date", None))
+
+
+def history_price_rows(symbol: str, hist, request) -> list[dict[str, object]]:
+    if not is_history_range_requested(request) or hist is None or hist.empty or "收盘" not in hist.columns:
+        return []
+
+    rows = hist.copy()
+    if "日期" not in rows.columns:
+        return []
+
+    rows["_trade_date"] = rows["日期"].apply(normalize_trade_date)
+    rows = rows[rows["_trade_date"].astype(bool)].sort_values("_trade_date")
+
+    start = getattr(request, "start_date", None)
+    end = getattr(request, "end_date", None) or getattr(request, "trade_date", None)
+    start_text = start.isoformat() if start else None
+    end_text = end.isoformat() if end else None
+
+    price_rows: list[dict[str, object]] = []
+    previous_close = 0.0
+    for _, row in rows.iterrows():
+        trade_date = str(row["_trade_date"])
+        close = to_float(row.get("收盘"))
+        if close <= 0:
+            continue
+
+        provided_pct_change = row.get("涨跌幅")
+        pct_change = compute_pct_change(close, previous_close or close, provided_pct_change)
+        previous_close = close
+        if start_text and trade_date < start_text:
+            continue
+        if end_text and trade_date > end_text:
+            continue
+
+        open_price = to_float(row.get("开盘"), default=close)
+        price_rows.append(
+            {
+                "symbol": symbol,
+                "trade_date": trade_date,
+                "open": open_price,
+                "close": close,
+                "high": to_float(row.get("最高"), default=max(close, open_price)),
+                "low": to_float(row.get("最低"), default=min(close, open_price)),
+                "volume": int(to_float(row.get("成交量"), default=0)),
+                "amount": to_float(row.get("成交额")),
+                "pct_change": pct_change,
+            }
+        )
+
+    return price_rows
+
+
 def compute_pct_change(close: float, previous_close: float, provided: object = None) -> float:
     value = to_float(provided, default=0.0)
     if value:
@@ -602,18 +888,26 @@ def notify_progress(progress_callback, completed: int, total: int, message: str)
 
 
 def latest_date_str(value: object, request) -> str:
-    if request.trade_date:
+    if request.trade_date and not is_history_range_requested(request):
         return request.trade_date.isoformat()
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value or date.today())
+    return normalize_trade_date(value)
+
+
+def normalize_trade_date(value: object) -> str:
+    if value is None:
+        return date.today().isoformat()
+    parsed = pd.to_datetime(value, errors="coerce")
+    if not pd.isna(parsed):
+        return parsed.date().isoformat()
+    text = str(value).strip()
+    return text[:10] if text else date.today().isoformat()
 
 
 def to_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
     try:
-        text = str(value).replace(",", "").strip()
+        text = str(value).replace(",", "").replace("%", "").strip()
         if text in {"", "-", "nan", "None"}:
             return default
         return float(text)
@@ -623,6 +917,11 @@ def to_float(value, default: float = 0.0) -> float:
 
 def strip_symbol(symbol: str) -> str:
     return symbol.split(".")[0]
+
+
+def listing_exchange_name(symbol_or_code: str) -> str:
+    plain_code = strip_symbol(str(symbol_or_code or "")).strip().zfill(6)
+    return infer_exchange(plain_code)
 
 
 def market_prefixed_code(code: str) -> str:

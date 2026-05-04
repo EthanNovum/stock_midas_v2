@@ -2,7 +2,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AliasModel(BaseModel):
@@ -24,6 +24,8 @@ class TradeSignal(str, Enum):
 class DataSyncStatus(str, Enum):
     queued = "queued"
     running = "running"
+    paused = "paused"
+    stopped = "stopped"
     success = "success"
     failed = "failed"
 
@@ -43,9 +45,15 @@ class ScreenerQuery(AliasModel):
     filters: dict[str, Any] = Field(default_factory=dict)
     ownership: list[str] = Field(default_factory=list)
     exchanges: list[str] = Field(default_factory=list)
+    signals: list[TradeSignal] = Field(default_factory=list)
     page: int = 1
     page_size: int = Field(default=20, alias="pageSize", ge=1, le=100)
     sort: dict[str, Any] | None = None
+
+
+class StockMetadataUpdate(BaseModel):
+    industry: str | None = None
+    ownership: str | None = None
 
 
 class DataSyncJobCreate(AliasModel):
@@ -60,9 +68,18 @@ class DataSyncJobCreate(AliasModel):
     markets: list[str] = Field(default_factory=lambda: ["A"])
     symbols: list[str] | None = None
     trade_date: date | None = Field(default=None, alias="tradeDate")
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
     full_refresh: bool = Field(default=False, alias="fullRefresh")
+    full_universe: bool = Field(default=False, alias="fullUniverse")
     limit: int = Field(default=300, ge=1, le=10000)
     update_mode: DataSyncUpdateMode = Field(default=DataSyncUpdateMode.full, alias="updateMode")
+
+    @model_validator(mode="after")
+    def validate_date_range(self):
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValueError("startDate must be on or before endDate")
+        return self
 
 
 class WatchlistCreate(AliasModel):
@@ -86,6 +103,7 @@ class TradeCreate(AliasModel):
     quantity: float
     price: float
     traded_at: date | datetime | None = Field(default=None, alias="tradedAt")
+    note: str = ""
 
 
 class TradeUpdate(AliasModel):
@@ -95,31 +113,47 @@ class TradeUpdate(AliasModel):
     quantity: float | None = None
     price: float | None = None
     traded_at: date | datetime | None = Field(default=None, alias="tradedAt")
+    note: str | None = None
+
+
+class CashAdjustmentCreate(AliasModel):
+    portfolio_id: int = Field(default=1, alias="portfolioId")
+    side: Literal["deposit", "withdraw"]
+    amount: float = Field(gt=0)
+    traded_at: date | datetime | None = Field(default=None, alias="tradedAt")
+    note: str = ""
 
 
 class AppearanceUpdate(BaseModel):
-    theme: Literal["light", "dark", "system"]
+    theme: Literal["light", "dark"]
 
 
-class LlmUpdate(AliasModel):
-    provider: str = Field(min_length=1)
-    model: str = Field(min_length=1)
-    base_url: str | None = Field(default=None, alias="baseUrl")
-    apiKey: str | None = None
+class ReportStockCreate(AliasModel):
+    symbol: str
+    name: str | None = None
 
 
-class LlmModelCreate(AliasModel):
-    provider: str = Field(min_length=1)
-    model: str = Field(min_length=1)
-    base_url: str | None = Field(default=None, alias="baseUrl")
-    apiKey: str | None = None
+class ReportStockVerdictUpdate(BaseModel):
+    verdict: Literal["win", "loss", "flat"]
 
 
 class ReportCreate(AliasModel):
-    title: str
-    ticker: str
-    ticker_name: str = Field(alias="tickerName")
+    title: str | None = None
+    ticker: str | None = None
+    ticker_name: str | None = Field(default=None, alias="tickerName")
+    stocks: list[ReportStockCreate] = Field(default_factory=list)
     rating: Rating
     institution: str
+    date: date
+    content: str
+    source_url: str | None = Field(default=None, alias="sourceUrl")
+    source_file_name: str | None = Field(default=None, alias="sourceFileName")
+    source_file_mime: str | None = Field(default=None, alias="sourceFileMime")
+    source_file_content: str | None = Field(default=None, alias="sourceFileContent")
+
+
+class ReportUpdate(AliasModel):
+    title: str
+    rating: Rating
     date: date
     content: str

@@ -31,8 +31,29 @@ When Eastmoney snapshot/history endpoints abort the connection, the sync service
 
 - `limit`: max stock tasks for this run, default `300`
 - `updateMode`: `full` for full data refresh, `price_only` for latest-price refresh on existing screener rows
+- `startDate` / `endDate`: optional daily-price date range, formatted as `YYYY-MM-DD`
+- `fullUniverse`: when `true`, the sync expands the run to the full A-share universe by using a `10000` task cap
 
-Job status responses include `totalTasks`, `completedTasks`, and `progressPercent`. The frontend shows a confirmation modal before submitting and refreshes progress only when the user clicks the refresh button, plus one delayed status fetch about 10 seconds after submission.
+Job status responses include `startDate`, `endDate`, `fullUniverse`, `totalTasks`, `completedTasks`, `progressPercent`, `isRealtime`, `backend`, and `pollIntervalMs`. `POST /api/v1/data-sync/jobs/{jobId}/pause`, `/resume`, and `/stop` control active jobs. `GET /api/v1/data-sync/datasets` reports current row counts plus daily-price `fromDate` / `toDate` coverage. The frontend shows a confirmation modal before submitting and then auto-polls job status while the task is active.
+
+### Redis mode vs non-Redis mode
+
+The sync pipeline supports two runtime modes:
+
+1. Redis mode (`REDIS_URL` is configured and reachable)
+- Redis stores realtime job state and control flags (`pause`/`resume`/`stop`).
+- `GET /api/v1/data-sync/jobs/{jobId}` prefers realtime state and returns:
+  - `isRealtime: true`
+  - `backend: "redis"`
+  - `pollIntervalMs` (recommended polling interval)
+- SQLite is still the durable source of truth for history.
+
+2. SQLite fallback mode (`REDIS_URL` missing or unavailable)
+- Jobs still run normally with sqlite-backed state.
+- APIs return:
+  - `isRealtime: false`
+  - `backend: "sqlite-fallback"`
+- No Redis dependency is required for basic functionality; Redis only improves realtime coordination and status freshness.
 
 ## Dashboard Market Data
 

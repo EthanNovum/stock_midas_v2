@@ -2,20 +2,16 @@ import React, { useEffect, useState } from 'react';
 import { 
   LineChart, 
   Line, 
-  ResponsiveContainer, 
-  XAxis, 
-  YAxis, 
-  Tooltip as ReTooltip 
+  ResponsiveContainer
 } from 'recharts';
 import { 
   TrendingUp, 
   TrendingDown, 
   ExternalLink,
-  ChevronRight,
-  Plus
+  ChevronRight
 } from 'lucide-react';
 import { cn } from '@/src/lib/utils';
-import { StockData, NewsItem } from '@/src/types';
+import { StockData, NewsItem, StockRef } from '@/src/types';
 
 interface MarketStatus {
   status: string;
@@ -48,7 +44,12 @@ const EMPTY_MARKET_STATUS: MarketStatus = {
 
 const formatSignedPercent = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 
-export const Dashboard: React.FC = () => {
+interface DashboardProps {
+  onOpenWatchlist?: () => void;
+  onOpenStockDetail?: (stock: StockRef) => void;
+}
+
+export const Dashboard: React.FC<DashboardProps> = ({ onOpenWatchlist, onOpenStockDetail }) => {
   const [indices, setIndices] = useState<StockData[]>([]);
   const [watchlist, setWatchlist] = useState<StockData[]>([]);
   const [news, setNews] = useState<NewsItem[]>([]);
@@ -77,9 +78,9 @@ export const Dashboard: React.FC = () => {
           fetch('/api/v1/market/status'),
           fetch('/api/v1/market/indices'),
           fetch('/api/v1/watchlists?group_by=flat'),
-          fetch('/api/v1/news?limit=3'),
-          fetch('/api/v1/market/movers?direction=gainers&limit=2'),
-          fetch('/api/v1/market/movers?direction=losers&limit=2'),
+          fetch('/api/v1/news?limit=6'),
+          fetch('/api/v1/market/movers?direction=gainers&limit=10'),
+          fetch('/api/v1/market/movers?direction=losers&limit=10'),
         ]);
 
         const responses = [
@@ -108,9 +109,7 @@ export const Dashboard: React.FC = () => {
         if (!isMounted) return;
 
         const firstWatchlistGroup = watchlistPayload.groups?.[0];
-        setMarketStatus(statusPayload);
-        setIndices(indicesPayload.items ?? []);
-        setWatchlist((firstWatchlistGroup?.stocks ?? []).slice(0, 5).map((stock) => ({
+        const watchlistStocks = (firstWatchlistGroup?.stocks ?? []).slice(0, 6).map((stock) => ({
           symbol: stock.symbol,
           name: stock.name,
           price: stock.price,
@@ -118,7 +117,11 @@ export const Dashboard: React.FC = () => {
           pctChange: stock.pct,
           sector: stock.sector,
           trend: stock.trend,
-        })));
+        }));
+
+        setMarketStatus(statusPayload);
+        setIndices(indicesPayload.items ?? []);
+        setWatchlist(watchlistStocks);
         setNews(newsPayload.items ?? []);
         setGainers(gainersPayload.items ?? []);
         setLosers(losersPayload.items ?? []);
@@ -144,6 +147,10 @@ export const Dashboard: React.FC = () => {
       isMounted = false;
     };
   }, []);
+
+  const openStockDetail = (stock: StockRef) => {
+    onOpenStockDetail?.(stock);
+  };
 
   return (
     <div className="space-y-10 max-w-7xl mx-auto">
@@ -233,54 +240,47 @@ export const Dashboard: React.FC = () => {
         <div className="lg:col-span-8 bg-surface-container-low rounded-[2rem] p-8">
           <div className="flex justify-between items-center mb-8">
             <h2 className="text-2xl font-extrabold font-headline text-primary">我的自选股</h2>
-            <button type="button" className="text-xs font-bold text-primary px-4 py-2 rounded-lg bg-surface-container-highest hover:bg-surface-dim transition-colors">
+            <button
+              type="button"
+              onClick={onOpenWatchlist}
+              className="text-xs font-bold text-primary px-4 py-2 rounded-lg bg-surface-container-highest hover:bg-surface-dim transition-colors"
+            >
               管理列表
             </button>
           </div>
 
-          <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {isLoading && watchlist.length === 0 && (
-              <div className="bg-surface-container-lowest rounded-xl p-6 text-center text-sm font-bold text-on-surface-variant">
+              <div className="md:col-span-2 bg-surface-container-lowest rounded-xl p-6 text-center text-sm font-bold text-on-surface-variant">
                 正在加载自选股...
               </div>
             )}
             {!isLoading && !errorMessage && watchlist.length === 0 && (
-              <div className="bg-surface-container-lowest rounded-xl p-6 text-center text-sm font-bold text-on-surface-variant">
+              <div className="md:col-span-2 bg-surface-container-lowest rounded-xl p-6 text-center text-sm font-bold text-on-surface-variant">
                 暂无自选股数据，请先同步选股器数据或添加自选股。
               </div>
             )}
             {watchlist.map((stock) => (
-              <div key={stock.symbol} className="bg-surface-container-lowest rounded-xl p-4 flex items-center justify-between hover:scale-[1.01] transition-transform shadow-sm">
-                <div className="flex items-center gap-4 w-1/3">
-                  <div className="w-10 h-10 rounded-lg bg-primary-container flex items-center justify-center text-tertiary-fixed font-bold text-[10px]">
+              <button
+                key={stock.symbol}
+                type="button"
+                onClick={() => openStockDetail({ symbol: stock.symbol, name: stock.name })}
+                className="w-full bg-surface-container-lowest rounded-xl px-4 py-3 flex items-center justify-between gap-3 hover:scale-[1.01] transition-transform shadow-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+              >
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="w-10 h-10 rounded-lg bg-primary-container flex shrink-0 items-center justify-center text-tertiary-fixed font-bold text-[10px]">
                     {stock.symbol.split('.')[0]}
                   </div>
-                  <div>
-                    <h4 className="font-bold text-primary">{stock.name}</h4>
-                    <p className="text-[10px] uppercase font-bold text-on-surface-variant tracking-wider">{stock.sector}</p>
+                  <div className="min-w-0">
+                    <h4 className="truncate font-bold text-primary">{stock.name}</h4>
+                    <p className="truncate text-[10px] uppercase font-bold text-on-surface-variant tracking-wider">
+                      {stock.sector ?? stock.symbol}
+                    </p>
                   </div>
                 </div>
 
-                <div className="w-1/4 h-8 flex items-center">
-                  {(stock.trend?.length ?? 0) > 0 ? (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={stock.trend?.map((val, i) => ({ val, i }))}>
-                        <Line
-                          type="monotone"
-                          dataKey="val"
-                          stroke={stock.pctChange >= 0 ? "#ba1a1a" : "#005111"}
-                          strokeWidth={2}
-                          dot={false}
-                        />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : (
-                    <span className="text-[10px] font-bold text-on-surface-variant/60">暂无趋势</span>
-                  )}
-                </div>
-
-                <div className="text-right">
-                  <div className="font-bold tabular-nums text-lg">{stock.price.toFixed(2)}</div>
+                <div className="shrink-0 text-right">
+                  <div className="font-bold tabular-nums text-base">{stock.price.toFixed(2)}</div>
                   <div className={cn(
                     "text-xs font-bold",
                     stock.pctChange >= 0 ? "text-error" : "text-tertiary-container"
@@ -288,7 +288,7 @@ export const Dashboard: React.FC = () => {
                     {stock.pctChange >= 0 ? '+' : ''}{stock.pctChange}%
                   </div>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
 
@@ -303,10 +303,15 @@ export const Dashboard: React.FC = () => {
                   <p className="text-xs font-bold text-on-surface-variant">暂无涨幅数据</p>
                 )}
                 {gainers.map((item) => (
-                  <div key={item.symbol} className="flex justify-between items-center text-sm">
+                  <button
+                    key={item.symbol}
+                    type="button"
+                    onClick={() => openStockDetail({ symbol: item.symbol, name: item.name })}
+                    className="flex w-full justify-between items-center text-sm text-left rounded-lg px-2 py-1 transition-colors hover:bg-surface-container-low focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                  >
                     <span className="font-bold text-primary">{item.name}</span>
                     <span className="text-error font-bold">{formatSignedPercent(item.pctChange)}</span>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>
@@ -321,10 +326,15 @@ export const Dashboard: React.FC = () => {
                   <p className="text-xs font-bold text-on-surface-variant">暂无跌幅数据</p>
                 )}
                 {losers.map((item) => (
-                  <div key={item.symbol} className="flex justify-between items-center text-sm">
+                  <button
+                    key={item.symbol}
+                    type="button"
+                    onClick={() => openStockDetail({ symbol: item.symbol, name: item.name })}
+                    className="flex w-full justify-between items-center text-sm text-left rounded-lg px-2 py-1 transition-colors hover:bg-surface-container-low focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                  >
                     <span className="font-bold text-primary">{item.name}</span>
                     <span className="text-tertiary-container font-bold">{formatSignedPercent(item.pctChange)}</span>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>

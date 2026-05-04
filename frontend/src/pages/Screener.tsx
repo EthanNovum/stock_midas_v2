@@ -1,31 +1,43 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { 
+import React, { useEffect, useRef, useState } from 'react';
+import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
-  Plus, 
-  RotateCcw, 
-  Play, 
-  Download, 
-  Columns, 
+  Plus,
+  RotateCcw,
+  Play,
+  Download,
+  Columns,
   Filter,
-  Check,
   TrendingUp,
-  TrendingDown
+  TrendingDown,
+  X,
+  ChevronDown,
+  ChevronUp,
+  LineChart,
 } from 'lucide-react';
 import { cn } from '@/src/lib/utils';
+import { StockRef } from '@/src/types';
 
 type TradeSignal = 'buy' | 'sell' | 'hold';
 
 interface ScreeningResult {
   symbol: string;
   name: string;
+  exchange?: string;
+  listingExchange?: string;
+  ownership?: string;
+  tradeDate?: string;
   industry: string;
   price: number;
   change: number;
   marketCap: string;
   pe: number;
   dividend: number;
+  revenueSegments?: Array<{
+    name: string;
+    revenuePercent: number;
+  }>;
   initial: string;
   ma120: number;
   ma120Lower: number;
@@ -50,6 +62,14 @@ interface NumericFilterState {
   enabled: boolean;
 }
 
+interface AppliedScreenerQuery {
+  numericFilters: NumericFilterState[];
+  ownership: string[];
+  exchanges: string[];
+  signals: TradeSignal[];
+  sort: SortConfig;
+}
+
 interface ScreenerResponse {
   items: ScreeningResult[];
   page: number;
@@ -69,14 +89,20 @@ interface ScreenerOptionsResponse {
   exchanges: string[];
 }
 
+interface WatchlistGroup {
+  id: string;
+  name: string;
+  groupType?: string;
+}
+
+interface ScreenerProps {
+  onOpenStockDetail: (stock: StockRef) => void;
+}
+
 const PAGE_SIZE = 20;
-const REQUIRED_OWNERSHIP_OPTIONS = ['央企', '地方国企', '民企'];
+const REQUIRED_OWNERSHIP_OPTIONS = ['央企', '地方国企', '民营企业'];
 const REQUIRED_EXCHANGE_OPTIONS = ['沪深', '北交所', '创业板'];
-const SIGNAL_SORT_VALUE: Record<TradeSignal, number> = {
-  sell: 1,
-  hold: 2,
-  buy: 3,
-};
+const SIGNAL_OPTIONS: TradeSignal[] = ['buy', 'sell', 'hold'];
 
 const mergeOptions = (requiredOptions: string[], apiOptions?: string[]) => (
   Array.from(new Set([...requiredOptions, ...(apiOptions ?? [])].filter(Boolean)))
@@ -101,41 +127,36 @@ const getSignalLabel = (signal: TradeSignal) => {
   return '观望';
 };
 
-const parseMarketCap = (marketCap: string) => {
-  const value = Number(marketCap.replace(/,/g, ''));
-  return Number.isFinite(value) ? value : 0;
+const getOwnershipBadgeLabel = (ownership?: string) => {
+  if (!ownership) return '-';
+  if (ownership.includes('央企')) return '央';
+  if (ownership.includes('地方国企')) return '国';
+  if (ownership.includes('民企') || ownership.includes('民营')) return '民';
+  return '-';
 };
 
-const getSortValue = (stock: ScreeningResult, field: SortField) => {
-  if (field === 'price') return stock.price;
-  if (field === 'marketCap') return parseMarketCap(stock.marketCap);
-  if (field === 'pe') return stock.pe;
-  if (field === 'dividend') return Number(stock.dividend ?? 0);
-  return SIGNAL_SORT_VALUE[stock.signal];
-};
-
-const sortResults = (items: ScreeningResult[], sort: SortConfig) => (
-  [...items].sort((a, b) => {
-    const aValue = getSortValue(a, sort.field);
-    const bValue = getSortValue(b, sort.field);
-    const direction = sort.direction === 'asc' ? 1 : -1;
-
-    if (aValue === bValue) {
-      return a.symbol.localeCompare(b.symbol);
-    }
-
-    return aValue > bValue ? direction : -direction;
-  })
+const formatPe = (pe: number) => (
+  Number(pe ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 );
+
+const formatRevenueSegments = (segments?: ScreeningResult['revenueSegments']) => {
+  if (!segments || segments.length === 0) return '-';
+  return segments
+    .map((segment) => `${segment.name} ${Number(segment.revenuePercent ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)
+    .join(' / ');
+};
 
 const mergeResultsBySymbol = (existing: ScreeningResult[], incoming: ScreeningResult[]) => {
   const seen = new Set(existing.map((item) => item.symbol));
   return [...existing, ...incoming.filter((item) => !seen.has(item.symbol))];
 };
 
-export const Screener: React.FC = () => {
+const cloneNumericFilters = (filters: NumericFilterState[]) => filters.map((filter) => ({ ...filter }));
+
+export const Screener: React.FC<ScreenerProps> = ({ onOpenStockDetail }) => {
   const [activeExchanges, setActiveExchanges] = useState<string[]>([]);
   const [activeOwnership, setActiveOwnership] = useState<string[]>([]);
+  const [activeSignals, setActiveSignals] = useState<TradeSignal[]>(SIGNAL_OPTIONS);
   const [ownershipOptions, setOwnershipOptions] = useState<string[]>([]);
   const [exchangeOptions, setExchangeOptions] = useState<string[]>([]);
   const [baseNumericFilters, setBaseNumericFilters] = useState<NumericFilterState[]>([]);
@@ -147,11 +168,28 @@ export const Screener: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [sortConfig, setSortConfig] = useState<SortConfig>({ field: 'marketCap', direction: 'desc' });
+  const [watchlistGroups, setWatchlistGroups] = useState<WatchlistGroup[]>([]);
+  const [isWatchlistDialogOpen, setIsWatchlistDialogOpen] = useState(false);
+  const [selectedStockForWatchlist, setSelectedStockForWatchlist] = useState<ScreeningResult | null>(null);
+  const [selectedWatchlistGroupId, setSelectedWatchlistGroupId] = useState('');
+  const [isSavingWatchlist, setIsSavingWatchlist] = useState(false);
+  const [expandedStocks, setExpandedStocks] = useState<Set<string>>(new Set());
+  const [appliedQuery, setAppliedQuery] = useState<AppliedScreenerQuery>({
+    numericFilters: [],
+    ownership: [],
+    exchanges: [],
+    signals: SIGNAL_OPTIONS,
+    sort: { field: 'marketCap', direction: 'desc' },
+  });
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
 
-  const toggleFilter = (list: string[], setList: React.Dispatch<React.SetStateAction<string[]>>, item: string) => {
+  const toggleFilter = <T extends string>(
+    list: T[],
+    setList: React.Dispatch<React.SetStateAction<T[]>>,
+    item: T
+  ) => {
     if (list.includes(item)) {
-      setList(list.filter(i => i !== item));
+      setList(list.filter((i) => i !== item));
     } else {
       setList([...list, item]);
     }
@@ -178,6 +216,7 @@ export const Screener: React.FC = () => {
     numericSource = numericFilters,
     ownershipSource = activeOwnership,
     exchangeSource = activeExchanges,
+    signalSource = activeSignals,
     sortSource = sortConfig
   ) => {
     const filters = numericSource.reduce<Record<string, { operator: 'lt' | 'gt'; value: number }>>((acc, filter) => {
@@ -192,6 +231,7 @@ export const Screener: React.FC = () => {
       filters,
       ownership: ownershipSource,
       exchanges: exchangeSource,
+      signals: signalSource,
       page: targetPage,
       pageSize: PAGE_SIZE,
       sort: sortSource,
@@ -203,6 +243,7 @@ export const Screener: React.FC = () => {
     numericSource = numericFilters,
     ownershipSource = activeOwnership,
     exchangeSource = activeExchanges,
+    signalSource = activeSignals,
     mode: 'replace' | 'append' = 'replace',
     sortSource = sortConfig
   ) => {
@@ -213,7 +254,7 @@ export const Screener: React.FC = () => {
       const response = await fetch('/api/v1/screener/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildFilterPayload(targetPage, numericSource, ownershipSource, exchangeSource, sortSource)),
+        body: JSON.stringify(buildFilterPayload(targetPage, numericSource, ownershipSource, exchangeSource, signalSource, sortSource)),
       });
 
       if (!response.ok) {
@@ -229,6 +270,16 @@ export const Screener: React.FC = () => {
       setTotal(payload.total ?? 0);
       setAvailableTotal(payload.availableTotal ?? 0);
       setPage(payload.page ?? targetPage);
+      if (mode === 'replace') {
+        setAppliedQuery({
+          numericFilters: cloneNumericFilters(numericSource),
+          ownership: [...ownershipSource],
+          exchanges: [...exchangeSource],
+          signals: [...signalSource],
+          sort: sortSource,
+        });
+        setExpandedStocks(new Set());
+      }
     } catch (error) {
       if (mode === 'replace') {
         setResults([]);
@@ -288,7 +339,7 @@ export const Screener: React.FC = () => {
   }, []);
 
   const handleRunScreener = () => {
-    void fetchScreenerResults(1);
+    void fetchScreenerResults(1, numericFilters, activeOwnership, activeExchanges, activeSignals);
   };
 
   const handleClearFilters = () => {
@@ -296,7 +347,8 @@ export const Screener: React.FC = () => {
     setNumericFilters(resetFilters);
     setActiveOwnership(ownershipOptions);
     setActiveExchanges(exchangeOptions);
-    void fetchScreenerResults(1, resetFilters, ownershipOptions, exchangeOptions);
+    setActiveSignals(SIGNAL_OPTIONS);
+    void fetchScreenerResults(1, resetFilters, ownershipOptions, exchangeOptions, SIGNAL_OPTIONS);
   };
 
   const handleSortChange = (field: SortField) => {
@@ -305,19 +357,99 @@ export const Screener: React.FC = () => {
       direction: sortConfig.field === field && sortConfig.direction === 'desc' ? 'asc' : 'desc',
     };
     setSortConfig(nextSort);
-    void fetchScreenerResults(1, numericFilters, activeOwnership, activeExchanges, 'replace', nextSort);
+    void fetchScreenerResults(
+      1,
+      appliedQuery.numericFilters,
+      appliedQuery.ownership,
+      appliedQuery.exchanges,
+      appliedQuery.signals,
+      'replace',
+      nextSort
+    );
   };
 
   const handleLoadMore = () => {
     if (isLoading || results.length >= total) return;
-    void fetchScreenerResults(page + 1, numericFilters, activeOwnership, activeExchanges, 'append', sortConfig);
+    void fetchScreenerResults(
+      page + 1,
+      appliedQuery.numericFilters,
+      appliedQuery.ownership,
+      appliedQuery.exchanges,
+      appliedQuery.signals,
+      'append',
+      appliedQuery.sort
+    );
+  };
+
+  const toggleStockDetails = (symbol: string) => {
+    setExpandedStocks((current) => {
+      const next = new Set(current);
+      if (next.has(symbol)) {
+        next.delete(symbol);
+      } else {
+        next.add(symbol);
+      }
+      return next;
+    });
+  };
+
+  const openWatchlistDialog = async (stock: ScreeningResult) => {
+    setSelectedStockForWatchlist(stock);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch('/api/v1/watchlists?group_by=all');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as { groups?: WatchlistGroup[] };
+      const groups = payload.groups ?? [];
+      setWatchlistGroups(groups);
+      setSelectedWatchlistGroupId(groups[0]?.id ?? '');
+      setIsWatchlistDialogOpen(true);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? `加载自选分组失败: ${error.message}` : '加载自选分组失败');
+    }
+  };
+
+  const closeWatchlistDialog = () => {
+    setIsWatchlistDialogOpen(false);
+    setSelectedStockForWatchlist(null);
+    setSelectedWatchlistGroupId('');
+  };
+
+  const handleConfirmAddToWatchlist = async () => {
+    if (!selectedStockForWatchlist || !selectedWatchlistGroupId) return;
+
+    setIsSavingWatchlist(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await fetch(`/api/v1/watchlists/${encodeURIComponent(selectedWatchlistGroupId)}/stocks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: selectedStockForWatchlist.symbol }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      closeWatchlistDialog();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? `加入自选失败: ${error.message}` : '加入自选失败');
+    } finally {
+      setIsSavingWatchlist(false);
+    }
   };
 
   const handleExport = () => {
     const params = new URLSearchParams();
-    params.set('filters', JSON.stringify(buildFilterPayload(1).filters));
-    activeOwnership.forEach((item) => params.append('ownership', item));
-    activeExchanges.forEach((item) => params.append('exchanges', item));
+    params.set('filters', JSON.stringify(buildFilterPayload(
+      1,
+      appliedQuery.numericFilters,
+      appliedQuery.ownership,
+      appliedQuery.exchanges,
+      appliedQuery.signals,
+      appliedQuery.sort
+    ).filters));
+    appliedQuery.ownership.forEach((item) => params.append('ownership', item));
+    appliedQuery.exchanges.forEach((item) => params.append('exchanges', item));
+    appliedQuery.signals.forEach((item) => params.append('signals', item));
     window.location.assign(`/api/v1/screener/export?${params.toString()}`);
   };
 
@@ -327,10 +459,11 @@ export const Screener: React.FC = () => {
   });
   const hasOwnershipFilter = activeOwnership.length !== ownershipOptions.length;
   const hasExchangeFilter = activeExchanges.length !== exchangeOptions.length;
-  const hasActiveFilters = enabledNumericFilters.length > 0 || hasOwnershipFilter || hasExchangeFilter;
-  const sortedResults = useMemo(() => sortResults(results, sortConfig), [results, sortConfig]);
+  const hasSignalFilter = activeSignals.length !== SIGNAL_OPTIONS.length;
+  const hasActiveFilters = enabledNumericFilters.length > 0 || hasOwnershipFilter || hasExchangeFilter || hasSignalFilter;
+  const displayedResults = results;
   const loadedCount = results.length;
-  const hasMoreResults = loadedCount < total;
+  const hasMoreResults = results.length < total;
 
   useEffect(() => {
     const target = loadMoreRef.current;
@@ -345,7 +478,7 @@ export const Screener: React.FC = () => {
     observer.observe(target);
 
     return () => observer.disconnect();
-  }, [hasMoreResults, isLoading, errorMessage, page, results.length, numericFilters, activeOwnership, activeExchanges, sortConfig]);
+  }, [hasMoreResults, isLoading, errorMessage, page, results.length, appliedQuery]);
 
   const renderSortableHeader = (field: SortField, label: string, align: 'right' | 'center' = 'right') => {
     const isActive = sortConfig.field === field;
@@ -368,20 +501,105 @@ export const Screener: React.FC = () => {
     );
   };
 
+  const renderMobileCards = () => (
+    <div data-testid="screener-mobile-cards" className="md:hidden divide-y divide-surface-container-low/60">
+      {displayedResults.map((stock) => {
+        const isExpanded = expandedStocks.has(stock.symbol);
+
+        return (
+          <article key={stock.symbol} className="p-3 space-y-2.5">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <p className="w-24 truncate whitespace-nowrap text-base font-bold text-primary" title={stock.name}>{stock.name}</p>
+                <p className="text-[11px] font-mono text-on-surface-variant/70 tracking-wider">{stock.symbol}</p>
+                <p className="text-xs text-on-surface-variant mt-1">{stock.industry || '-'}</p>
+              </div>
+              <span
+                className={cn(
+                  "inline-flex items-center justify-center gap-1 min-w-14 px-2.5 py-1 rounded-md text-[11px] font-black",
+                  stock.signal === 'buy' && "bg-error-container/40 text-error",
+                  stock.signal === 'sell' && "bg-tertiary-container/10 text-tertiary-container",
+                  stock.signal === 'hold' && "bg-surface-container-highest text-on-surface-variant"
+                )}
+              >
+                {getSignalLabel(stock.signal)}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
+              <p><span className="text-on-surface-variant">收盘价</span> <span className="font-bold">{stock.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span></p>
+              <p><span className="text-on-surface-variant">涨跌幅</span> <span className="font-bold">{stock.change >= 0 ? '+' : ''}{stock.change}%</span></p>
+              <p><span className="text-on-surface-variant">市值</span> <span className="font-bold">{stock.marketCap}</span></p>
+              <p><span className="text-on-surface-variant">市盈率</span> <span className="font-bold">{formatPe(stock.pe)}</span></p>
+              <p><span className="text-on-surface-variant">股息率</span> <span className="font-bold">{Number(stock.dividend ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%</span></p>
+              <p><span className="text-on-surface-variant">MA120 信号</span> <span className="font-bold">{getSignalLabel(stock.signal)}</span></p>
+            </div>
+
+            {isExpanded && (
+              <div className="space-y-1.5 overflow-hidden rounded-xl bg-surface-container-low/50 p-2.5 text-xs">
+                <div className="flex items-center gap-3 overflow-x-auto whitespace-nowrap">
+                  <p><span className="text-on-surface-variant">最近交易日</span> <span className="font-bold">{stock.tradeDate || '-'}</span></p>
+                  <p><span className="text-on-surface-variant">板块</span> <span className="font-bold">{stock.exchange || stock.listingExchange || '-'}</span></p>
+                  <p><span className="text-on-surface-variant">公司性质</span> <span className="font-bold">{stock.ownership || '-'}</span></p>
+                  <button
+                    type="button"
+                    onClick={() => onOpenStockDetail({ symbol: stock.symbol, name: stock.name })}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-primary px-2.5 py-1.5 text-xs font-black text-surface transition-colors hover:opacity-90"
+                  >
+                    <LineChart size={14} />
+                    K线
+                  </button>
+                </div>
+                <div className="flex items-center gap-3 overflow-x-auto whitespace-nowrap">
+                  <p><span className="text-on-surface-variant">MA120</span> <span className="font-bold">{stock.ma120.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span></p>
+                  <p><span className="text-on-surface-variant">0.88</span> <span className="font-bold">{stock.ma120Lower.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span></p>
+                  <p><span className="text-on-surface-variant">1.12</span> <span className="font-bold">{stock.ma120Upper.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span></p>
+                  <p className="min-w-0 truncate" title={formatRevenueSegments(stock.revenueSegments)}>
+                    <span className="text-on-surface-variant">前三营收</span> <span className="font-bold">{formatRevenueSegments(stock.revenueSegments)}</span>
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => void openWatchlistDialog(stock)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-black bg-surface-container text-primary hover:bg-surface-container-highest transition-colors"
+              >
+                <Plus size={14} />
+                自选
+              </button>
+              <button
+                type="button"
+                onClick={() => toggleStockDetails(stock.symbol)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-black text-on-surface-variant hover:text-primary hover:bg-surface-container transition-colors"
+                aria-expanded={isExpanded}
+              >
+                {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                {isExpanded ? '收起详情' : '查看详情'}
+              </button>
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  );
+
   return (
-    <div className="space-y-8 max-w-7xl mx-auto">
+    <div className="w-full px-2 sm:px-3 lg:px-4 xl:px-5 space-y-3 md:space-y-4 lg:space-y-5">
       {/* Header */}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-3">
         <div>
           <h1 className="text-4xl font-extrabold font-headline text-primary tracking-tight">高级选股器</h1>
           <p className="text-on-surface-variant mt-2 font-medium">通过精准过滤发现高潜力中国 A 股标的。</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={handleClearFilters}
             data-feedback="筛选条件已清空"
-            className="flex items-center gap-2 px-6 py-2.5 rounded-xl border border-outline-variant/20 text-on-surface-variant font-bold text-sm hover:bg-surface-container-low transition-colors"
+            className="flex items-center gap-2 px-4 py-2 rounded-xl border border-outline-variant/20 text-on-surface-variant font-bold text-sm hover:bg-surface-container-low transition-colors"
           >
             <RotateCcw size={16} />
             一键清除
@@ -391,7 +609,7 @@ export const Screener: React.FC = () => {
             onClick={handleRunScreener}
             disabled={isLoading}
             data-feedback="正在运行真实数据筛选"
-            className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-primary text-surface font-bold text-sm shadow-lg shadow-primary/20 hover:opacity-90 active:scale-95 transition-all disabled:opacity-50"
+            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-surface font-bold text-sm shadow-lg shadow-primary/20 hover:opacity-90 active:scale-95 transition-all disabled:opacity-50"
           >
             <Play size={16} fill="currentColor" />
             {isLoading ? '筛选中' : '运行筛选'}
@@ -399,104 +617,177 @@ export const Screener: React.FC = () => {
         </div>
       </div>
 
-      {/* Filter Bento Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Numerical Constraints */}
-        <div className="lg:col-span-8 bg-surface-container-lowest rounded-3xl p-8 shadow-sm border border-outline-variant/10 relative overflow-hidden">
-          <div className="absolute top-0 right-0 w-32 h-32 bg-tertiary-fixed/10 rounded-bl-full pointer-events-none" />
-          <h3 className="text-xs font-black text-primary uppercase tracking-[0.2em] mb-8 flex items-center gap-2">
-            <Filter size={14} className="text-primary" />
-            Numerical Constraints
-          </h3>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-            {numericFilters.map((filter) => (
-              <div key={filter.key} className="space-y-3">
+      {/* Compact Filters */}
+      <div className="rounded-2xl border border-outline-variant/15 bg-surface-container-lowest p-2 shadow-sm">
+        <div className="space-y-1.5">
+          <div className="flex flex-col gap-1.5 rounded-xl border border-tertiary/15 bg-tertiary/5 px-2.5 py-1.5 lg:flex-row lg:items-center">
+            <div className="flex min-w-20 items-center gap-1.5 text-xs font-black text-tertiary">
+              <Filter size={15} />
+              数值
+            </div>
+            <div className="flex flex-1 flex-wrap items-center gap-1.5">
+              {numericFilters.map((filter) => (
                 <button
                   type="button"
+                  key={filter.key}
                   onClick={() => toggleNumericFilter(filter.key)}
-                  className="flex items-center gap-3 group cursor-pointer text-left"
+                  className={cn(
+                    "flex h-8 items-center gap-1.5 rounded-lg border bg-surface px-2 text-xs transition-colors",
+                    filter.enabled ? "border-tertiary/40 text-tertiary shadow-sm" : "border-outline-variant/20 bg-surface/60 text-on-surface-variant hover:bg-surface"
+                  )}
+                  aria-pressed={filter.enabled}
                 >
-                  <div className={cn(
-                    "w-5 h-5 rounded border flex items-center justify-center bg-surface transition-colors group-hover:border-primary",
-                    filter.enabled ? "border-primary" : "border-outline"
-                  )}>
-                    {filter.enabled && <Check size={12} className="text-primary stroke-[3px]" />}
-                  </div>
-                  <span className="text-sm font-bold text-on-surface-variant group-hover:text-primary transition-colors">
-                    {filter.label}
-                  </span>
-                </button>
-                <div className="relative">
-                  <input 
-                    type="text" 
+                  <span className="font-black whitespace-nowrap">{filter.label}</span>
+                  <span className="font-bold text-on-surface-variant/70">{filter.operator === 'lt' ? '<' : '>'}</span>
+                  <input
+                    type="text"
                     value={filter.value}
+                    onClick={(event) => event.stopPropagation()}
                     onChange={(event) => updateNumericFilterValue(filter.key, event.target.value)}
-                    className="w-full bg-surface-container-low border-b-2 border-outline/20 focus:border-primary px-4 py-3 text-sm font-bold text-on-surface outline-none transition-all rounded-t-xl text-right"
+                    className="h-6 w-16 rounded-md bg-surface-container-low px-2 text-right font-black text-on-surface outline-none focus:ring-1 focus:ring-primary"
                   />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Categorical Attributes */}
-        <div className="lg:col-span-4 bg-surface-container-lowest rounded-3xl p-8 shadow-sm border border-outline-variant/10">
-          <h3 className="text-xs font-black text-primary uppercase tracking-[0.2em] mb-8 flex items-center gap-2">
-            <Plus size={16} className="text-primary" />
-            Attributes
-          </h3>
-
-          <div className="space-y-8">
-            <div>
-              <p className="text-[10px] font-black text-secondary uppercase tracking-[0.15em] mb-4">公司性质 (Ownership)</p>
-              <div className="flex flex-wrap gap-2">
-                {ownershipOptions.map(o => (
-                  <button 
-                    type="button"
-                    key={o}
-                    onClick={() => toggleFilter(activeOwnership, setActiveOwnership, o)}
-                    className={cn(
-                      "px-4 py-1.5 rounded-full text-xs font-bold transition-all",
-                      activeOwnership.includes(o) 
-                        ? "bg-tertiary-fixed text-primary" 
-                        : "bg-surface-container text-on-surface-variant hover:bg-surface-container-highest"
-                    )}
-                  >
-                    {o}
-                  </button>
-                ))}
-              </div>
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setNumericFilters((filters) => filters.map((filter) => ({ ...filter, enabled: true })))}
+                className="h-8 px-2 text-xs font-black text-primary hover:underline"
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                onClick={() => setNumericFilters((filters) => filters.map((filter) => ({ ...filter, enabled: false })))}
+                className="h-8 border-l border-outline-variant/25 pl-3 pr-1 text-xs font-black text-on-surface-variant hover:text-primary"
+              >
+                清除
+              </button>
             </div>
+          </div>
 
-            <div>
-              <p className="text-[10px] font-black text-secondary uppercase tracking-[0.15em] mb-4">上市地点 (Exchange)</p>
-              <div className="flex flex-wrap gap-2">
-                {exchangeOptions.map(e => (
-                  <button 
-                    type="button"
-                    key={e}
-                    onClick={() => toggleFilter(activeExchanges, setActiveExchanges, e)}
-                    className={cn(
-                      "px-4 py-1.5 rounded-full text-xs font-bold transition-all",
-                      activeExchanges.includes(e) 
-                        ? "bg-tertiary-fixed text-primary" 
-                        : "bg-surface-container text-on-surface-variant hover:bg-surface-container-highest"
-                    )}
-                  >
-                    {e}
-                  </button>
-                ))}
-              </div>
+          <div className="flex flex-col gap-1.5 rounded-xl border border-tertiary/15 bg-tertiary/5 px-2.5 py-1.5 lg:flex-row lg:items-center">
+            <div className="flex min-w-20 items-center gap-1.5 text-xs font-black text-tertiary">
+              <Plus size={15} />
+              公司性质
+            </div>
+            <div className="flex flex-1 flex-wrap items-center gap-1.5">
+              {ownershipOptions.map((option) => (
+                <button
+                  type="button"
+                  key={option}
+                  onClick={() => toggleFilter(activeOwnership, setActiveOwnership, option)}
+                  className={cn(
+                    "h-8 rounded-lg border px-2.5 text-xs font-black transition-all",
+                    activeOwnership.includes(option)
+                      ? "border-tertiary/40 bg-surface text-tertiary shadow-sm"
+                      : "border-outline-variant/20 bg-surface/60 text-on-surface-variant hover:bg-surface"
+                  )}
+                >
+                  {option}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setActiveOwnership(ownershipOptions)}
+                className="h-8 px-2 text-xs font-black text-primary hover:underline"
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveOwnership([])}
+                className="h-8 border-l border-outline-variant/25 pl-3 pr-1 text-xs font-black text-on-surface-variant hover:text-primary"
+              >
+                清除
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1.5 rounded-xl border border-tertiary/15 bg-tertiary/5 px-2.5 py-1.5 lg:flex-row lg:items-center">
+            <div className="flex min-w-20 items-center gap-1.5 text-xs font-black text-tertiary">
+              <Columns size={15} />
+              板块
+            </div>
+            <div className="flex flex-1 flex-wrap items-center gap-1.5">
+              {exchangeOptions.map((option) => (
+                <button
+                  type="button"
+                  key={option}
+                  onClick={() => toggleFilter(activeExchanges, setActiveExchanges, option)}
+                  className={cn(
+                    "h-8 rounded-lg border px-2.5 text-xs font-black transition-all",
+                    activeExchanges.includes(option)
+                      ? "border-tertiary/40 bg-surface text-tertiary shadow-sm"
+                      : "border-outline-variant/20 bg-surface/60 text-on-surface-variant hover:bg-surface"
+                  )}
+                >
+                  {option}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setActiveExchanges(exchangeOptions)}
+                className="h-8 px-2 text-xs font-black text-primary hover:underline"
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveExchanges([])}
+                className="h-8 border-l border-outline-variant/25 pl-3 pr-1 text-xs font-black text-on-surface-variant hover:text-primary"
+              >
+                清除
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1.5 rounded-xl border border-tertiary/15 bg-tertiary/5 px-2.5 py-1.5 lg:flex-row lg:items-center">
+            <div className="flex min-w-20 items-center gap-1.5 text-xs font-black text-tertiary">
+              <ArrowUpDown size={15} />
+              信号
+            </div>
+            <div className="flex flex-1 flex-wrap items-center gap-1.5">
+              {SIGNAL_OPTIONS.map((signal) => (
+                <button
+                  type="button"
+                  key={signal}
+                  onClick={() => toggleFilter(activeSignals, setActiveSignals, signal)}
+                  className={cn(
+                    "h-8 rounded-lg border px-2.5 text-xs font-black transition-all",
+                    activeSignals.includes(signal)
+                      ? "border-tertiary/40 bg-surface text-tertiary shadow-sm"
+                      : "border-outline-variant/20 bg-surface/60 text-on-surface-variant hover:bg-surface"
+                  )}
+                >
+                  {getSignalLabel(signal)}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setActiveSignals(SIGNAL_OPTIONS)}
+                className="h-8 px-2 text-xs font-black text-primary hover:underline"
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSignals([])}
+                className="h-8 border-l border-outline-variant/25 pl-3 pr-1 text-xs font-black text-on-surface-variant hover:text-primary"
+              >
+                清除
+              </button>
+              <span className="ml-auto hidden text-xs font-bold text-on-surface-variant/70 sm:inline">
+                生效条件 {enabledNumericFilters.length + (hasOwnershipFilter ? 1 : 0) + (hasExchangeFilter ? 1 : 0) + (hasSignalFilter ? 1 : 0)} 项
+              </span>
             </div>
           </div>
         </div>
       </div>
 
       {/* Results Table */}
-      <div className="bg-surface-container-lowest rounded-3xl shadow-sm border border-outline-variant/10 overflow-hidden">
-        <div className="px-8 py-6 border-b border-surface-container flex justify-between items-center bg-surface-bright/50 backdrop-blur-sm">
-          <h3 className="text-lg font-bold font-headline text-primary flex items-center gap-3">
+      <div className="bg-surface-container-lowest rounded-2xl shadow-sm border border-outline-variant/10 overflow-hidden">
+        <div className="px-4 py-3 border-b border-surface-container flex justify-between items-center bg-surface-bright/50 backdrop-blur-sm">
+          <h3 className="text-lg font-bold font-headline text-primary flex items-center gap-2">
             筛选结果
             <span className="text-sm font-medium text-on-surface-variant bg-surface-container px-3 py-1 rounded-full">
               {isLoading ? '加载中' : `${total} 标的命中`}
@@ -512,147 +803,216 @@ export const Screener: React.FC = () => {
             >
               <Download size={20} />
             </button>
-            <button type="button" aria-label="配置显示列" className="p-2 text-on-surface-variant hover:text-primary hover:bg-surface-container transition-all rounded-lg">
-              <Columns size={20} />
-            </button>
           </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[1180px] text-left border-collapse">
+        {isLoading && results.length === 0 && (
+          <div className="md:hidden px-4 py-10 text-center text-sm font-bold text-on-surface-variant">
+            正在加载真实选股数据...
+          </div>
+        )}
+
+        {!isLoading && errorMessage && (
+          <div className="md:hidden px-4 py-10 text-center text-sm font-bold text-error">
+            无法加载选股器数据: {errorMessage}
+          </div>
+        )}
+
+        {!isLoading && !errorMessage && displayedResults.length === 0 && (
+          <div className="md:hidden px-4 py-10 text-center text-sm font-bold text-on-surface-variant">
+            {availableTotal === 0
+              ? '暂无真实选股数据，请先到设置页点击“更新选股器数据”。'
+              : '当前筛选条件下无结果，请放宽条件或点击“一键清除”。'}
+            {availableTotal > 0 && hasActiveFilters && (
+              <div className="mt-3 text-xs font-medium text-on-surface-variant/80">
+                生效条件：数值筛选 {enabledNumericFilters.length} 项，公司性质 {activeOwnership.length}/{ownershipOptions.length} 项，上市板块 {activeExchanges.length}/{exchangeOptions.length} 项，信号 {activeSignals.length}/{SIGNAL_OPTIONS.length} 项
+              </div>
+            )}
+          </div>
+        )}
+
+        {!isLoading && !errorMessage && displayedResults.length > 0 && renderMobileCards()}
+
+        <div data-testid="screener-desktop-table" className="hidden md:block overflow-x-auto">
+          <table className="w-full min-w-[760px] text-left border-collapse">
             <thead>
               <tr className="bg-surface-container-low/50 text-[10px] font-black text-on-surface-variant uppercase tracking-[0.15em]">
-                <th className="px-6 py-4 font-black whitespace-nowrap">代码/简称</th>
-                <th className="px-6 py-4 font-black whitespace-nowrap">行业</th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'price' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
-                  {renderSortableHeader('price', '最新价 (¥)')}
+                <th className="px-2 md:px-3 py-2 font-black whitespace-nowrap">名称/代码/行业</th>
+                <th className="px-2 md:px-3 py-2 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'price' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  {renderSortableHeader('price', '收盘价 (¥)')}
                 </th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap">涨跌幅</th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap">MA120</th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap">MA120 × 0.88</th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap">MA120 × 1.12</th>
-                <th className="px-6 py-4 font-black text-center whitespace-nowrap" aria-sort={sortConfig.field === 'signal' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
-                  {renderSortableHeader('signal', '信号', 'center')}
+                <th className="px-2 md:px-3 py-2 font-black text-right whitespace-nowrap">涨跌幅</th>
+                <th className="px-2 md:px-3 py-2 font-black text-center whitespace-nowrap" aria-sort={sortConfig.field === 'signal' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  {renderSortableHeader('signal', 'MA120 信号', 'center')}
                 </th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'marketCap' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                <th className="px-2 md:px-3 py-2 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'marketCap' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
                   {renderSortableHeader('marketCap', '市值 (亿 RMB)')}
                 </th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'pe' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                <th className="px-2 md:px-3 py-2 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'pe' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
                   {renderSortableHeader('pe', '市盈率 (TTM)')}
                 </th>
-                <th className="px-6 py-4 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'dividend' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                <th className="px-2 md:px-3 py-2 font-black text-right whitespace-nowrap" aria-sort={sortConfig.field === 'dividend' ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
                   {renderSortableHeader('dividend', '股息率 (%)')}
                 </th>
+                <th className="px-2 md:px-3 py-2 font-black text-center whitespace-nowrap">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y-0">
               {isLoading && results.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center text-sm font-bold text-on-surface-variant">
+                  <td colSpan={8} className="px-3 py-8 text-center text-sm font-bold text-on-surface-variant">
                     正在加载真实选股数据...
                   </td>
                 </tr>
               )}
               {!isLoading && errorMessage && (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center text-sm font-bold text-error">
+                  <td colSpan={8} className="px-3 py-8 text-center text-sm font-bold text-error">
                     无法加载选股器数据: {errorMessage}
                   </td>
                 </tr>
               )}
-              {!isLoading && !errorMessage && results.length === 0 && (
+              {!isLoading && !errorMessage && displayedResults.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center text-sm font-bold text-on-surface-variant">
+                  <td colSpan={8} className="px-3 py-8 text-center text-sm font-bold text-on-surface-variant">
                     {availableTotal === 0
                       ? '暂无真实选股数据，请先到设置页点击“更新选股器数据”。'
                       : '当前筛选条件下无结果，请放宽条件或点击“一键清除”。'}
                     {availableTotal > 0 && hasActiveFilters && (
                       <div className="mt-3 text-xs font-medium text-on-surface-variant/80">
-                        生效条件：数值筛选 {enabledNumericFilters.length} 项，公司性质 {activeOwnership.length}/{ownershipOptions.length} 项，上市地点 {activeExchanges.length}/{exchangeOptions.length} 项
+                        生效条件：数值筛选 {enabledNumericFilters.length} 项，公司性质 {activeOwnership.length}/{ownershipOptions.length} 项，上市板块 {activeExchanges.length}/{exchangeOptions.length} 项，信号 {activeSignals.length}/{SIGNAL_OPTIONS.length} 项
                       </div>
                     )}
                   </td>
                 </tr>
               )}
-              {sortedResults.map((stock) => (
-                <tr key={stock.symbol} className={cn(
-                  "group cursor-pointer transition-colors border-b-2 border-surface-container-low/30",
-                  "hover:bg-surface-container-low/50"
-                )}>
-                  <td className="px-6 py-5">
-                    <div className="flex items-center gap-4">
-                      <div className={cn(
-                        "w-9 h-9 rounded-xl flex items-center justify-center font-black text-xs transition-transform group-hover:scale-110 duration-300",
-                        activeExchanges.includes('沪深') ? "bg-primary/5 text-primary" : "bg-secondary/10 text-secondary"
-                      )}>
-                        {stock.initial}
-                      </div>
-                      <div>
-                        <div className="font-bold text-primary text-base group-hover:text-primary-container transition-colors">
-                          {stock.name}
-                        </div>
-                        <div className="text-[10px] font-bold text-on-surface-variant/70 font-mono tracking-wider">
-                          {stock.symbol}
-                        </div>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-5 text-sm font-medium text-on-surface-variant whitespace-nowrap">
-                    {stock.industry || '-'}
-                  </td>
-                  <td className="px-6 py-5 text-right font-bold text-on-surface tabular-nums">
-                    {stock.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                  </td>
-                  <td className="px-6 py-5 text-right">
-                    <span className={cn(
-                      "inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-black shadow-sm",
-                      stock.change >= 0 
-                        ? "bg-error-container/40 text-error" 
-                        : "bg-tertiary-container/10 text-tertiary-container"
+              {displayedResults.map((stock) => {
+                const isExpanded = expandedStocks.has(stock.symbol);
+
+                return (
+                  <React.Fragment key={stock.symbol}>
+                    <tr className={cn(
+                      "group transition-colors border-b border-surface-container-low/30",
+                      "hover:bg-surface-container-low/50",
+                      isExpanded && "bg-surface-container-low/30"
                     )}>
-                      {stock.change >= 0 ? <TrendingUp size={14} className="stroke-[3px]" /> : <TrendingDown size={14} className="stroke-[3px]" />}
-                      {stock.change >= 0 ? '+' : ''}{stock.change}%
-                    </span>
-                  </td>
-                  <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs tabular-nums">
-                    {stock.ma120.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                  </td>
-                  <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs tabular-nums">
-                    {stock.ma120Lower.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                  </td>
-                  <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs tabular-nums">
-                    {stock.ma120Upper.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                  </td>
-                  <td className="px-6 py-5 text-center">
-                    <span className={cn(
-                      "inline-flex items-center justify-center gap-1.5 min-w-16 px-3 py-1 rounded-lg text-xs font-black shadow-sm",
-                      stock.signal === 'buy' && "bg-error-container/40 text-error",
-                      stock.signal === 'sell' && "bg-tertiary-container/10 text-tertiary-container",
-                      stock.signal === 'hold' && "bg-surface-container-highest text-on-surface-variant"
-                    )}>
-                      {stock.signal === 'buy' && <TrendingUp size={14} className="stroke-[3px]" />}
-                      {stock.signal === 'sell' && <TrendingDown size={14} className="stroke-[3px]" />}
-                      {getSignalLabel(stock.signal)}
-                    </span>
-                  </td>
-                  <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs">
-                    {stock.marketCap}
-                  </td>
-                  <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs">
-                    {stock.pe}
-                  </td>
-                  <td className="px-6 py-5 text-right font-medium text-on-surface-variant font-mono text-xs">
-                    {Number(stock.dividend ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                </tr>
-              ))}
+                      <td className="px-2 md:px-3 py-3">
+                        <div className="flex items-center gap-2.5">
+                          <div className={cn(
+                            "w-9 h-9 rounded-xl flex items-center justify-center font-black text-xs transition-transform group-hover:scale-110 duration-300",
+                            activeExchanges.includes('沪深') ? "bg-primary/5 text-primary" : "bg-secondary/10 text-secondary"
+                          )} title={stock.ownership || '公司性质未知'}>
+                            {getOwnershipBadgeLabel(stock.ownership)}
+                          </div>
+                          <div>
+                            <div className="w-24 truncate whitespace-nowrap font-bold text-primary text-base group-hover:text-primary-container transition-colors" title={stock.name}>
+                              {stock.name}
+                            </div>
+                            <div className="text-[10px] font-bold text-on-surface-variant/70 font-mono tracking-wider">
+                              {stock.symbol}
+                            </div>
+                            <div className="text-xs font-medium text-on-surface-variant mt-1">
+                              {stock.industry || '-'}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-right font-bold text-on-surface tabular-nums">
+                        {stock.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-right">
+                        <span className={cn(
+                          "inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-black shadow-sm",
+                          stock.change >= 0
+                            ? "bg-error-container/40 text-error"
+                            : "bg-tertiary-container/10 text-tertiary-container"
+                        )}>
+                          {stock.change >= 0 ? <TrendingUp size={14} className="stroke-[3px]" /> : <TrendingDown size={14} className="stroke-[3px]" />}
+                          {stock.change >= 0 ? '+' : ''}{stock.change}%
+                        </span>
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-center">
+                        <span className={cn(
+                          "inline-flex items-center justify-center gap-1 min-w-14 px-2 py-1 rounded-lg text-xs font-black shadow-sm",
+                          stock.signal === 'buy' && "bg-error-container/40 text-error",
+                          stock.signal === 'sell' && "bg-tertiary-container/10 text-tertiary-container",
+                          stock.signal === 'hold' && "bg-surface-container-highest text-on-surface-variant"
+                        )}>
+                          {stock.signal === 'buy' && <TrendingUp size={14} className="stroke-[3px]" />}
+                          {stock.signal === 'sell' && <TrendingDown size={14} className="stroke-[3px]" />}
+                          {getSignalLabel(stock.signal)}
+                        </span>
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-right font-medium text-on-surface-variant font-mono text-xs">
+                        {stock.marketCap}
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-right font-medium text-on-surface-variant font-mono text-xs">
+                        {formatPe(stock.pe)}
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-right font-medium text-on-surface-variant font-mono text-xs">
+                        {Number(stock.dividend ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-2 md:px-3 py-3 text-center">
+                        <div className="inline-flex items-center justify-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => void openWatchlistDialog(stock)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-black bg-surface-container text-primary hover:bg-surface-container-highest transition-colors"
+                          >
+                            <Plus size={14} />
+                            自选
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleStockDetails(stock.symbol)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-black text-on-surface-variant hover:text-primary hover:bg-surface-container transition-colors"
+                            aria-expanded={isExpanded}
+                          >
+                            {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                            {isExpanded ? '收起' : '详情'}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                    {isExpanded && (
+                      <tr className="border-b-2 border-surface-container-low/40 bg-surface-container-low/20">
+                        <td colSpan={8} className="px-3 py-3">
+                          <div className="space-y-2 text-xs text-on-surface-variant">
+                            <div className="flex items-center gap-5 whitespace-nowrap">
+                              <p><span className="font-black text-on-surface">最近交易日：</span>{stock.tradeDate || '-'}</p>
+                              <p><span className="font-black text-on-surface">板块：</span>{stock.exchange || stock.listingExchange || '-'}</p>
+                              <p><span className="font-black text-on-surface">公司性质：</span>{stock.ownership || '-'}</p>
+                              <button
+                                type="button"
+                                onClick={() => onOpenStockDetail({ symbol: stock.symbol, name: stock.name })}
+                                className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-lg bg-primary px-2.5 py-1.5 text-xs font-black text-surface transition-colors hover:opacity-90"
+                              >
+                                <LineChart size={14} />
+                                K线
+                              </button>
+                            </div>
+                            <div className="flex min-w-0 items-center gap-5 whitespace-nowrap">
+                              <p><span className="font-black text-on-surface">MA120：</span>{stock.ma120.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                              <p><span className="font-black text-on-surface">MA120×0.88：</span>{stock.ma120Lower.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                              <p><span className="font-black text-on-surface">MA120×1.12：</span>{stock.ma120Upper.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                              <p className="min-w-0 truncate" title={formatRevenueSegments(stock.revenueSegments)}>
+                                <span className="font-black text-on-surface">前三营收业务：</span>{formatRevenueSegments(stock.revenueSegments)}
+                              </p>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>
 
         <div
           ref={loadMoreRef}
-          className="px-8 py-5 bg-surface-bright/50 border-t border-surface-container flex flex-col sm:flex-row items-center justify-between gap-4"
+          className="px-3 py-3 bg-surface-bright/50 border-t border-surface-container flex flex-col sm:flex-row items-center justify-between gap-2"
         >
           <span className="text-xs font-bold text-on-surface-variant/70">
             已加载 {Math.min(loadedCount, total)} / {total} 条结果
@@ -668,6 +1028,64 @@ export const Screener: React.FC = () => {
           </button>
         </div>
       </div>
+      {isWatchlistDialogOpen && selectedStockForWatchlist && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-on-surface/45 px-4 backdrop-blur-sm">
+          <div role="dialog" aria-modal="true" aria-labelledby="watchlist-dialog-title" className="w-full max-w-md rounded-3xl bg-surface-container-lowest border border-outline-variant/20 shadow-2xl">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-outline-variant/15">
+              <div>
+                <p className="text-[10px] font-black text-secondary uppercase tracking-[0.18em]">Watchlist</p>
+                <h3 id="watchlist-dialog-title" className="text-xl font-[900] font-headline text-primary mt-1">加入自选分组</h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeWatchlistDialog}
+                className="p-2 rounded-lg text-on-surface-variant hover:bg-surface-container-low transition-colors"
+                aria-label="关闭"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="px-6 py-5 space-y-4">
+              <p className="text-sm text-on-surface-variant">
+                将 <span className="font-black text-primary">{selectedStockForWatchlist.name} ({selectedStockForWatchlist.symbol})</span> 加入到：
+              </p>
+
+              <select
+                value={selectedWatchlistGroupId}
+                onChange={(event) => setSelectedWatchlistGroupId(event.target.value)}
+                className="w-full rounded-xl border border-outline-variant/25 bg-surface px-4 py-3 text-sm font-bold text-on-surface outline-none focus:border-primary"
+              >
+                {watchlistGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.name}</option>
+                ))}
+              </select>
+
+              {watchlistGroups.length === 0 && (
+                <p className="text-xs font-bold text-error">暂无可用分组，请先在自选页创建分组。</p>
+              )}
+            </div>
+
+            <div className="px-6 py-5 border-t border-outline-variant/15 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeWatchlistDialog}
+                className="px-4 py-2.5 rounded-xl text-sm font-bold text-on-surface-variant hover:bg-surface-container-low transition-colors"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmAddToWatchlist()}
+                disabled={isSavingWatchlist || !selectedWatchlistGroupId}
+                className="px-5 py-2.5 rounded-xl text-sm font-black bg-primary text-surface hover:opacity-90 disabled:opacity-50 transition-all"
+              >
+                {isSavingWatchlist ? '加入中...' : '确认加入'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

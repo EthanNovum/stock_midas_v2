@@ -27,6 +27,7 @@ def export(
     filters: str | None = None,
     ownership: list[str] = Query(default_factory=list),
     exchanges: list[str] = Query(default_factory=list),
+    signals: list[str] = Query(default_factory=list),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     try:
@@ -36,7 +37,14 @@ def export(
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid filters query: {exc}") from exc
 
-    payload = ScreenerQuery(filters=parsed_filters, ownership=ownership, exchanges=exchanges, page=1, pageSize=100)
+    payload = ScreenerQuery(
+        filters=parsed_filters,
+        ownership=ownership,
+        exchanges=exchanges,
+        signals=signals,
+        page=1,
+        pageSize=100,
+    )
     result = screener.query(conn, payload)
     buffer = io.StringIO()
     buffer.write("symbol,name,price,change,ma120,ma120Lower,ma120Upper,signal,marketCap,pe,dividend\n")

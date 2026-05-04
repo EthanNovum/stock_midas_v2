@@ -75,6 +75,8 @@ class TradeSignal(str, Enum):
 class DataSyncStatus(str, Enum):
     queued = "queued"
     running = "running"
+    paused = "paused"
+    stopped = "stopped"
     success = "success"
     failed = "failed"
 
@@ -155,7 +157,10 @@ class DataSyncJobCreate(BaseModel):
     markets: list[str] = Field(default_factory=lambda: ["A"])
     symbols: list[str] | None = None
     trade_date: date | None = Field(default=None, alias="tradeDate")
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
     full_refresh: bool = Field(default=False, alias="fullRefresh")
+    full_universe: bool = Field(default=False, alias="fullUniverse")
     limit: int = Field(default=300, ge=1, le=10000)
     update_mode: DataSyncUpdateMode = Field(default=DataSyncUpdateMode.full, alias="updateMode")
 
@@ -168,6 +173,9 @@ class DataSyncJob(BaseModel):
     markets: list[str]
     limit: int
     update_mode: DataSyncUpdateMode = Field(alias="updateMode")
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
+    full_universe: bool = Field(default=False, alias="fullUniverse")
     total_tasks: int = Field(alias="totalTasks")
     completed_tasks: int = Field(alias="completedTasks")
     progress_percent: int = Field(alias="progressPercent")
@@ -176,6 +184,9 @@ class DataSyncJob(BaseModel):
     updated_rows: int = Field(default=0, alias="updatedRows")
     failed_rows: int = Field(default=0, alias="failedRows")
     message: str | None = None
+    is_realtime: bool = Field(default=False, alias="isRealtime")
+    backend: str = "sqlite-fallback"
+    poll_interval_ms: int = Field(default=0, alias="pollIntervalMs")
 ```
 
 FastAPI 返回前端字段时建议使用：
@@ -194,7 +205,7 @@ model.model_dump(by_alias=True)
 | symbol | TEXT UNIQUE NOT NULL | 证券代码 |
 | name | TEXT NOT NULL | 名称 |
 | market | TEXT | 市场，例如 `A`, `HK`, `US`, `INDEX` |
-| price | REAL NOT NULL | 最新价 |
+| price | REAL NOT NULL | 最近交易日收盘价 |
 | change | REAL NOT NULL | 涨跌额或涨跌值 |
 | pct_change | REAL NOT NULL | 涨跌幅百分比 |
 | volume | TEXT | 展示用成交量 |
@@ -315,9 +326,6 @@ model.model_dump(by_alias=True)
 | --- | --- | --- |
 | id | INTEGER PRIMARY KEY | 自增 ID |
 | theme | TEXT NOT NULL | `light`、`dark`、`system` |
-| provider | TEXT NOT NULL | `openai`、`gemini`、`anthropic`、`deepseek` |
-| model | TEXT NOT NULL | 模型 ID |
-| api_key_ciphertext | TEXT | 加密后的 API Key |
 | updated_at | TEXT NOT NULL | 更新时间 |
 
 ### 3.8 data_sync_jobs
@@ -328,7 +336,7 @@ model.model_dump(by_alias=True)
 | --- | --- | --- |
 | id | TEXT PRIMARY KEY | 任务 ID |
 | source | TEXT NOT NULL | 数据源，固定为 `akshare` |
-| status | TEXT NOT NULL | `queued`、`running`、`success`、`failed` |
+| status | TEXT NOT NULL | `queued`、`running`、`paused`、`stopped`、`success`、`failed` |
 | scopes_json | TEXT NOT NULL | 同步范围 JSON |
 | markets_json | TEXT NOT NULL | 市场范围 JSON |
 | symbols_json | TEXT | 指定股票代码 JSON；为空表示全量范围 |
@@ -354,8 +362,9 @@ model.model_dump(by_alias=True)
 | symbol | TEXT PRIMARY KEY | 证券代码，例如 `600519.SH` |
 | name | TEXT NOT NULL | 股票简称 |
 | market | TEXT NOT NULL | 市场，例如 `A` |
-| exchange | TEXT | 交易所或板块，例如 `沪深`、`创业板`、`北交所` |
-| ownership | TEXT | 公司性质，例如 `央企`、`地方国企`、`民企` |
+| exchange | TEXT | 上市板块，例如 `沪深`、`创业板`、`北交所` |
+| listing_exchange | TEXT | 板块，例如 `沪深`、`创业板`、`北交所` |
+| ownership | TEXT | 公司性质，例如 `央企`、`地方国企`、`民营企业` |
 | sector | TEXT | 行业 |
 | market_cap | REAL | 市值，单位亿元 |
 | pe_ttm | REAL | 市盈率 TTM |
@@ -641,7 +650,7 @@ model.model_dump(by_alias=True)
     {"key": "dividend", "label": "股息率 (%) >", "operator": "gt", "defaultValue": 3.5},
     {"key": "marketCap", "label": "市值 (亿 ¥) >", "operator": "gt", "defaultValue": 500}
   ],
-  "ownership": ["央企", "地方国企", "民企"],
+  "ownership": ["央企", "地方国企", "民营企业"],
   "exchanges": ["沪深", "创业板", "北交所"]
 }
 ```
@@ -839,7 +848,16 @@ model.model_dump(by_alias=True)
   ],
   "page": 1,
   "pageSize": 20,
-  "total": 3
+  "total": 3,
+  "institutionRankings": [
+    {
+      "institution": "中信证券",
+      "reportCount": 12,
+      "stockMentions": 18,
+      "wins": 9,
+      "winRate": 50.0
+    }
+  ]
 }
 ```
 
@@ -891,11 +909,28 @@ model.model_dump(by_alias=True)
 }
 ```
 
+#### PATCH `/api/v1/reports/{report_id}`
+
+编辑研报标题、日期、标签和内容。
+
+请求：
+
+```json
+{
+  "title": "宁德时代：全球锂电龙头地位稳固",
+  "rating": "hold",
+  "date": "2024-03-18",
+  "content": "更新后的核心观点..."
+}
+```
+
+响应：返回更新后的研报详情。
+
 ### 4.9 设置
 
 #### GET `/api/v1/settings`
 
-获取用户外观和 LLM 配置。API Key 永远不明文返回。
+获取用户外观和数据同步摘要。
 
 响应：
 
@@ -903,13 +938,6 @@ model.model_dump(by_alias=True)
 {
   "appearance": {
     "theme": "light"
-  },
-  "llm": {
-    "provider": "openai",
-    "model": "gpt-4o",
-    "hasApiKey": true,
-    "clusterStatus": "normal",
-    "latencyMs": 1.2
   },
   "dataSync": {
     "source": "akshare",
@@ -940,58 +968,6 @@ model.model_dump(by_alias=True)
 }
 ```
 
-#### PATCH `/api/v1/settings/llm`
-
-保存 LLM 供应商、模型和 API Key。`apiKey` 为可选字段；未传时保留旧密钥。
-
-请求：
-
-```json
-{
-  "provider": "openai",
-  "model": "gpt-4o",
-  "apiKey": "sk-..."
-}
-```
-
-响应：
-
-```json
-{
-  "provider": "openai",
-  "model": "gpt-4o",
-  "hasApiKey": true
-}
-```
-
-#### POST `/api/v1/settings/llm/test`
-
-测试当前 LLM 配置是否可用。
-
-响应：
-
-```json
-{
-  "ok": true,
-  "latencyMs": 312.4,
-  "message": "连接正常"
-}
-```
-
-#### POST `/api/v1/settings/llm/restart`
-
-对应前端“保存并重启集群”按钮。
-
-响应：
-
-```json
-{
-  "status": "restarted",
-  "clusterStatus": "normal",
-  "latencyMs": 1.2
-}
-```
-
 ### 4.10 数据同步
 
 设置页“更新选股器数据”按钮使用。后端通过 AkShare 获取 A 股股票基础信息、基本面指标和日线行情，并写入 sqlite3，供 `POST /api/v1/screener/query` 查询。
@@ -999,12 +975,15 @@ model.model_dump(by_alias=True)
 推荐后端行为：
 
 - `POST /api/v1/data-sync/jobs` 只提交任务并立即返回，不在 HTTP 请求中同步等待爬取完成
-- 同一时间只允许一个 `queued` 或 `running` 任务；重复提交返回 `409 Conflict` 或返回当前任务
+- 同一时间只允许一个 `queued`、`running` 或 `paused` 任务；重复提交返回 `409 Conflict` 或返回当前任务
 - 后端直接调用 AkShare，不使用本地静态兜底数据；AkShare 采集失败时任务状态为 `failed`，并在 `failedRows` 和 `message` 中记录错误
 - 当东方财富快照或日线接口断开连接时，后端会改用 AkShare 的 A 股代码列表与腾讯/新浪日线行情接口继续采集真实数据
-- 前端确认参数后提交任务，并提示用户等待约 10 秒；随后通过任务状态接口返回 `totalTasks`、`completedTasks` 和 `progressPercent`
+- 前端确认参数后提交任务，随后通过任务状态接口持续获取 `totalTasks`、`completedTasks` 和 `progressPercent`
 - `updateMode=full` 执行全量更新；`updateMode=price_only` 仅刷新已有股票的最新价格和信号，保留原有 MA120
-- 前端使用“刷新进度”按钮手动读取任务进展，不做持续轮询
+- 前端会在任务处于 `queued` / `running` / `paused` 时自动轮询状态，并可手动刷新
+- 前端可调用暂停、继续和停止接口控制任务；暂停会在下一次任务进度回调处等待，停止会把任务标记为 `stopped`
+- 当配置 `REDIS_URL` 时，后端会优先返回 Redis 实时状态（`isRealtime=true`, `backend=redis`），并携带推荐轮询间隔 `pollIntervalMs`
+- 当未配置 Redis 或 Redis 暂不可用时，后端自动回退到 sqlite 状态（`isRealtime=false`, `backend=sqlite-fallback`），不影响任务执行
 - `stock_fundamentals` 和 `stock_daily_prices` 使用 upsert，避免重复写入
 - 每只股票完成日线更新后计算 `ma120`、`ma120Lower`、`ma120Upper` 和 `signal`，写回 `stock_fundamentals`
 
@@ -1022,6 +1001,9 @@ model.model_dump(by_alias=True)
   "symbols": null,
   "tradeDate": null,
   "fullRefresh": true,
+  "fullUniverse": false,
+  "startDate": "2026-01-01",
+  "endDate": "2026-04-30",
   "limit": 300,
   "updateMode": "full"
 }
@@ -1036,7 +1018,10 @@ model.model_dump(by_alias=True)
 | markets | string[] | 否 | 当前建议只支持 `A` |
 | symbols | string[] \| null | 否 | 指定股票代码；为空表示按市场同步 |
 | tradeDate | string \| null | 否 | 指定交易日；为空表示最近交易日 |
+| startDate | string \| null | 否 | 同步日线开始日期 |
+| endDate | string \| null | 否 | 同步日线结束日期 |
 | fullRefresh | bool | 否 | 是否全量刷新历史数据 |
+| fullUniverse | bool | 否 | 是否覆盖 A 股全部上市公司；为 `true` 时按 `10000` 任务上限处理 |
 | limit | number | 否 | 本次最多处理的股票数量，默认 `300` |
 | updateMode | string | 否 | `full` 为全量更新；`price_only` 为仅更新现价 |
 
@@ -1051,6 +1036,9 @@ model.model_dump(by_alias=True)
   "markets": ["A"],
   "limit": 300,
   "updateMode": "full",
+  "startDate": "2026-01-01",
+  "endDate": "2026-04-30",
+  "fullUniverse": false,
   "totalTasks": 300,
   "completedTasks": 0,
   "progressPercent": 0,
@@ -1058,7 +1046,10 @@ model.model_dump(by_alias=True)
   "finishedAt": null,
   "updatedRows": 0,
   "failedRows": 0,
-  "message": "AkShare 数据同步任务已提交"
+  "message": "AkShare 数据同步任务已提交",
+  "isRealtime": false,
+  "backend": "sqlite-fallback",
+  "pollIntervalMs": 3000
 }
 ```
 
@@ -1077,6 +1068,9 @@ model.model_dump(by_alias=True)
   "markets": ["A"],
   "limit": 300,
   "updateMode": "full",
+  "startDate": "2026-01-01",
+  "endDate": "2026-04-30",
+  "fullUniverse": false,
   "totalTasks": 300,
   "completedTasks": 300,
   "progressPercent": 100,
@@ -1084,7 +1078,10 @@ model.model_dump(by_alias=True)
   "finishedAt": "2026-04-22T15:34:12+08:00",
   "updatedRows": 3820,
   "failedRows": 0,
-  "message": "真实行情数据更新完成，共写入 3820 条记录"
+  "message": "真实行情数据更新完成，共写入 3820 条记录",
+  "isRealtime": false,
+  "backend": "sqlite-fallback",
+  "pollIntervalMs": 0
 }
 ```
 
@@ -1106,13 +1103,34 @@ model.model_dump(by_alias=True)
   "finishedAt": "2026-04-22T15:30:08+08:00",
   "updatedRows": 0,
   "failedRows": 1,
-  "message": "数据更新失败: AkShare 实时行情接口返回空数据"
+  "message": "数据更新失败: AkShare 实时行情接口返回空数据",
+  "isRealtime": false,
+  "backend": "sqlite-fallback",
+  "pollIntervalMs": 0
 }
 ```
+
+#### POST `/api/v1/data-sync/jobs/{jobId}/pause`
+
+暂停正在排队或运行的同步任务。任务会在下一次股票级进度回调处停住，并保持为 `paused`。
+
+#### POST `/api/v1/data-sync/jobs/{jobId}/resume`
+
+继续已暂停的同步任务，状态恢复为 `running`。
+
+#### POST `/api/v1/data-sync/jobs/{jobId}/stop`
+
+停止正在排队、运行或暂停的同步任务，状态变为 `stopped`，并写入 `finishedAt`。
 
 #### GET `/api/v1/data-sync/jobs/{job_id}`
 
 轮询任务状态。
+
+新增状态元信息字段：
+
+- `isRealtime`：是否来自 Redis 实时状态
+- `backend`：`redis` 或 `sqlite-fallback`
+- `pollIntervalMs`：后端建议前端轮询间隔（毫秒）
 
 响应：
 
@@ -1132,7 +1150,10 @@ model.model_dump(by_alias=True)
   "finishedAt": null,
   "updatedRows": 1240,
   "failedRows": 0,
-  "message": "正在更新日线行情"
+  "message": "正在更新日线行情",
+  "isRealtime": true,
+  "backend": "redis",
+  "pollIntervalMs": 2000
 }
 ```
 
@@ -1264,5 +1285,5 @@ FastAPI 路由建议：
 | `Portfolio.tsx` 资产配置 | `allocationData` | `GET /portfolio/allocation` |
 | `Watchlist.tsx` 自选分组 | `watchListData` | `GET /watchlists` |
 | `Reports.tsx` 研报列表和详情 | `mockReports` | `GET /reports`、`GET /reports/{id}` |
-| `Settings.tsx` 外观和 LLM 配置 | React state | `GET /settings`、`PATCH /settings/*` |
-| `Settings.tsx` 数据更新按钮 | React state | `POST /api/v1/data-sync/jobs`、`GET /api/v1/data-sync/jobs/{id}` |
+| `Settings.tsx` 外观配置 | React state | `GET /settings`、`PATCH /settings/appearance` |
+| `Settings.tsx` 数据更新按钮 | React state | `POST /api/v1/data-sync/jobs`、`GET /api/v1/data-sync/jobs/{id}`、`POST /api/v1/data-sync/jobs/{id}/pause|resume|stop` |

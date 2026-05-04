@@ -16,7 +16,8 @@ SECTOR_COLORS = {
     "现金": "#d0e6f3",
 }
 
-TRADE_SIDES = {"buy", "sell", "dividend"}
+TRADE_SIDES = {"buy", "sell", "dividend", "deposit", "withdraw"}
+CASH_TRADE_SYMBOL = "CASH"
 
 
 def summary(conn: sqlite3.Connection) -> dict:
@@ -120,10 +121,18 @@ def create_trade(conn: sqlite3.Connection, payload) -> dict:
 
     cursor = conn.execute(
         """
-        INSERT INTO trades (portfolio_id, symbol, side, quantity, price, traded_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO trades (portfolio_id, symbol, side, quantity, price, traded_at, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (payload.portfolio_id, payload.symbol, payload.side, payload.quantity, payload.price, traded_at),
+        (
+            payload.portfolio_id,
+            payload.symbol,
+            payload.side,
+            payload.quantity,
+            payload.price,
+            traded_at,
+            normalize_note(payload.note),
+        ),
     )
     conn.commit()
     return {
@@ -134,13 +143,14 @@ def create_trade(conn: sqlite3.Connection, payload) -> dict:
         "quantity": payload.quantity,
         "price": payload.price,
         "tradedAt": traded_at,
+        "note": normalize_note(payload.note),
     }
 
 
 def list_trades(conn: sqlite3.Connection, portfolio_id: int = 1) -> dict:
     rows = conn.execute(
         """
-        SELECT id, portfolio_id, symbol, side, quantity, price, traded_at
+        SELECT id, portfolio_id, symbol, side, quantity, price, traded_at, note
         FROM trades
         WHERE portfolio_id=?
         ORDER BY traded_at DESC, id DESC
@@ -148,6 +158,48 @@ def list_trades(conn: sqlite3.Connection, portfolio_id: int = 1) -> dict:
         (portfolio_id,),
     ).fetchall()
     return {"items": [trade_row_to_dict(row) for row in rows]}
+
+
+def adjust_cash(conn: sqlite3.Connection, payload) -> dict:
+    traded_at = normalize_trade_date(payload.traded_at)
+    trade_payload = SimpleNamespace(
+        portfolio_id=payload.portfolio_id,
+        symbol=CASH_TRADE_SYMBOL,
+        side=payload.side,
+        quantity=payload.amount,
+        price=1.0,
+        traded_at=payload.traded_at,
+        note=payload.note,
+    )
+    validate_trade_payload(trade_payload)
+    apply_trade(conn, trade_payload)
+
+    cursor = conn.execute(
+        """
+        INSERT INTO trades (portfolio_id, symbol, side, quantity, price, traded_at, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.portfolio_id,
+            CASH_TRADE_SYMBOL,
+            payload.side,
+            payload.amount,
+            1.0,
+            traded_at,
+            normalize_note(payload.note),
+        ),
+    )
+    conn.commit()
+    next_cash = get_cash(conn, payload.portfolio_id)
+    return {
+        "id": cursor.lastrowid,
+        "portfolioId": payload.portfolio_id,
+        "side": payload.side,
+        "amount": round(payload.amount, 2),
+        "cash": round(next_cash, 2),
+        "tradedAt": traded_at,
+        "note": normalize_note(payload.note),
+    }
 
 
 def update_trade(conn: sqlite3.Connection, trade_id: int, payload) -> dict:
@@ -159,6 +211,7 @@ def update_trade(conn: sqlite3.Connection, trade_id: int, payload) -> dict:
         quantity=payload.quantity if payload.quantity is not None else original["quantity"],
         price=payload.price if payload.price is not None else original["price"],
         traded_at=payload.traded_at if payload.traded_at is not None else None,
+        note=payload.note if payload.note is not None else original["note"],
     )
     replacement_traded_at = normalize_trade_date(payload.traded_at) if payload.traded_at else original["traded_at"]
     validate_trade_payload(replacement)
@@ -169,7 +222,7 @@ def update_trade(conn: sqlite3.Connection, trade_id: int, payload) -> dict:
     conn.execute(
         """
         UPDATE trades
-        SET portfolio_id=?, symbol=?, side=?, quantity=?, price=?, traded_at=?
+        SET portfolio_id=?, symbol=?, side=?, quantity=?, price=?, traded_at=?, note=?
         WHERE id=?
         """,
         (
@@ -179,6 +232,7 @@ def update_trade(conn: sqlite3.Connection, trade_id: int, payload) -> dict:
             replacement.quantity,
             replacement.price,
             replacement_traded_at,
+            normalize_note(replacement.note),
             trade_id,
         ),
     )
@@ -196,7 +250,7 @@ def delete_trade(conn: sqlite3.Connection, trade_id: int) -> None:
 def get_trade(conn: sqlite3.Connection, trade_id: int) -> sqlite3.Row:
     row = conn.execute(
         """
-        SELECT id, portfolio_id, symbol, side, quantity, price, traded_at
+        SELECT id, portfolio_id, symbol, side, quantity, price, traded_at, note
         FROM trades
         WHERE id=?
         """,
@@ -217,12 +271,13 @@ def trade_row_to_dict(row: sqlite3.Row) -> dict:
         "price": row["price"],
         "totalAmount": round(row["quantity"] * row["price"], 2),
         "tradedAt": row["traded_at"],
+        "note": row["note"] or "",
     }
 
 
 def validate_trade_payload(payload) -> None:
     if payload.side not in TRADE_SIDES:
-        raise PortfolioError("交易方向必须为 buy、sell 或 dividend")
+        raise PortfolioError("交易方向必须为 buy、sell、dividend、deposit 或 withdraw")
     if payload.quantity <= 0 or payload.price <= 0:
         raise PortfolioError("交易数量和价格必须大于 0")
 
@@ -235,6 +290,10 @@ def normalize_trade_date(value) -> str:
     return now_iso()[:10]
 
 
+def normalize_note(value: str | None) -> str:
+    return (value or "").strip()
+
+
 def apply_trade(conn: sqlite3.Connection, payload) -> None:
     if payload.side == "buy":
         apply_buy(conn, payload)
@@ -242,8 +301,12 @@ def apply_trade(conn: sqlite3.Connection, payload) -> None:
         apply_sell(conn, payload)
     elif payload.side == "dividend":
         apply_dividend(conn, payload)
+    elif payload.side == "deposit":
+        apply_deposit(conn, payload)
+    elif payload.side == "withdraw":
+        apply_withdraw(conn, payload)
     else:
-        raise PortfolioError("交易方向必须为 buy、sell 或 dividend")
+        raise PortfolioError("交易方向必须为 buy、sell、dividend、deposit 或 withdraw")
 
 
 def reverse_trade(conn: sqlite3.Connection, trade: sqlite3.Row) -> None:
@@ -253,8 +316,12 @@ def reverse_trade(conn: sqlite3.Connection, trade: sqlite3.Row) -> None:
         reverse_sell(conn, trade)
     elif trade["side"] == "dividend":
         reverse_dividend(conn, trade)
+    elif trade["side"] == "deposit":
+        reverse_deposit(conn, trade)
+    elif trade["side"] == "withdraw":
+        reverse_withdraw(conn, trade)
     else:
-        raise PortfolioError("交易方向必须为 buy、sell 或 dividend")
+        raise PortfolioError("交易方向必须为 buy、sell、dividend、deposit 或 withdraw")
 
 
 def apply_buy(conn: sqlite3.Connection, payload) -> None:
@@ -263,6 +330,7 @@ def apply_buy(conn: sqlite3.Connection, payload) -> None:
     if cash < amount:
         raise PortfolioError("现金不足，无法买入")
 
+    market_price = get_latest_market_price(conn, payload.symbol, payload.price)
     holding = get_holding(conn, payload.portfolio_id, payload.symbol)
     if holding:
         new_quantity = holding["quantity"] + payload.quantity
@@ -273,7 +341,7 @@ def apply_buy(conn: sqlite3.Connection, payload) -> None:
             SET quantity=?, cost=?, price=?
             WHERE id=?
             """,
-            (new_quantity, round(new_cost, 4), payload.price, holding["id"]),
+            (new_quantity, round(new_cost, 4), market_price, holding["id"]),
         )
     else:
         stock = get_stock_metadata(conn, payload.symbol)
@@ -288,7 +356,7 @@ def apply_buy(conn: sqlite3.Connection, payload) -> None:
                 stock["name"],
                 payload.quantity,
                 payload.price,
-                payload.price,
+                market_price,
                 stock["sector"],
             ),
         )
@@ -302,13 +370,14 @@ def apply_sell(conn: sqlite3.Connection, payload) -> None:
         raise PortfolioError("持仓不足，无法卖出")
 
     cash = get_cash(conn, payload.portfolio_id)
+    market_price = get_latest_market_price(conn, payload.symbol, payload.price)
     new_quantity = holding["quantity"] - payload.quantity
     if new_quantity == 0:
         conn.execute("DELETE FROM holdings WHERE id=?", (holding["id"],))
     else:
         conn.execute(
             "UPDATE holdings SET quantity=?, price=? WHERE id=?",
-            (new_quantity, payload.price, holding["id"]),
+            (new_quantity, market_price, holding["id"]),
         )
 
     update_cash(conn, payload.portfolio_id, cash + payload.quantity * payload.price)
@@ -317,6 +386,19 @@ def apply_sell(conn: sqlite3.Connection, payload) -> None:
 def apply_dividend(conn: sqlite3.Connection, payload) -> None:
     cash = get_cash(conn, payload.portfolio_id)
     update_cash(conn, payload.portfolio_id, cash + payload.quantity * payload.price)
+
+
+def apply_deposit(conn: sqlite3.Connection, payload) -> None:
+    cash = get_cash(conn, payload.portfolio_id)
+    update_cash(conn, payload.portfolio_id, cash + payload.quantity * payload.price)
+
+
+def apply_withdraw(conn: sqlite3.Connection, payload) -> None:
+    cash = get_cash(conn, payload.portfolio_id)
+    amount = payload.quantity * payload.price
+    if cash < amount:
+        raise PortfolioError("现金不足，无法出金")
+    update_cash(conn, payload.portfolio_id, cash - amount)
 
 
 def reverse_buy(conn: sqlite3.Connection, trade: sqlite3.Row) -> None:
@@ -380,6 +462,19 @@ def reverse_dividend(conn: sqlite3.Connection, trade: sqlite3.Row) -> None:
     update_cash(conn, trade["portfolio_id"], cash - amount)
 
 
+def reverse_deposit(conn: sqlite3.Connection, trade: sqlite3.Row) -> None:
+    cash = get_cash(conn, trade["portfolio_id"])
+    amount = trade["quantity"] * trade["price"]
+    if cash < amount:
+        raise PortfolioError("无法撤销入金交易：现金不足")
+    update_cash(conn, trade["portfolio_id"], cash - amount)
+
+
+def reverse_withdraw(conn: sqlite3.Connection, trade: sqlite3.Row) -> None:
+    cash = get_cash(conn, trade["portfolio_id"])
+    update_cash(conn, trade["portfolio_id"], cash + trade["quantity"] * trade["price"])
+
+
 def get_cash(conn: sqlite3.Connection, portfolio_id: int) -> float:
     row = conn.execute("SELECT cash FROM portfolios WHERE id=?", (portfolio_id,)).fetchone()
     if not row:
@@ -408,9 +503,49 @@ def get_stock_metadata(conn: sqlite3.Connection, symbol: str) -> dict:
         "SELECT name, sector FROM stock_fundamentals WHERE symbol=?",
         (symbol,),
     ).fetchone()
+    if not row and is_plain_stock_code(symbol):
+        row = conn.execute(
+            """
+            SELECT name, sector
+            FROM stock_fundamentals
+            WHERE symbol LIKE ?
+            ORDER BY symbol
+            LIMIT 1
+            """,
+            (f"{symbol}.%",),
+        ).fetchone()
     if row:
         return {"name": row["name"], "sector": row["sector"] or "未分类"}
     return {"name": symbol, "sector": "未分类"}
+
+
+def get_latest_market_price(conn: sqlite3.Connection, symbol: str, fallback: float) -> float:
+    row = conn.execute(
+        """
+        SELECT close
+        FROM stock_daily_prices
+        WHERE symbol=?
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
+        (symbol,),
+    ).fetchone()
+    if not row and is_plain_stock_code(symbol):
+        row = conn.execute(
+            """
+            SELECT close
+            FROM stock_daily_prices
+            WHERE symbol LIKE ?
+            ORDER BY trade_date DESC, symbol ASC
+            LIMIT 1
+            """,
+            (f"{symbol}.%",),
+        ).fetchone()
+    return round(float(row["close"]), 4) if row else fallback
+
+
+def is_plain_stock_code(symbol: str) -> bool:
+    return len(symbol) == 6 and symbol.isdigit()
 
 
 def color_for(name: str) -> str:
