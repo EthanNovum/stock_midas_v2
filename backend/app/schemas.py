@@ -56,6 +56,18 @@ class StockMetadataUpdate(BaseModel):
     ownership: str | None = None
 
 
+class StockDailyRefreshRequest(AliasModel):
+    update_mode: DataSyncUpdateMode = Field(default=DataSyncUpdateMode.price_only, alias="updateMode")
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
+
+    @model_validator(mode="after")
+    def validate_date_range(self):
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValueError("startDate must be on or before endDate")
+        return self
+
+
 class DataSyncJobCreate(AliasModel):
     source: str = "akshare"
     scopes: list[DataSyncScope] = Field(
@@ -94,6 +106,10 @@ class WatchlistUpdate(BaseModel):
 class WatchlistStockCreate(BaseModel):
     symbol: str
     note: str | None = None
+
+
+class WatchlistStockTagsUpdate(BaseModel):
+    tags: list[str] = Field(default_factory=list)
 
 
 class TradeCreate(AliasModel):
@@ -154,6 +170,20 @@ class ReportCreate(AliasModel):
 
 class ReportUpdate(AliasModel):
     title: str
+    stocks: list[ReportStockCreate] = Field(default_factory=list)
     rating: Rating
     date: date
     content: str
+
+
+class InstitutionCreatePayload(AliasModel):
+    name: str
+
+
+class InstitutionRenamePayload(AliasModel):
+    institution: str
+    new_name: str = Field(alias="newName")
+
+
+class InstitutionDeletePayload(AliasModel):
+    institution: str

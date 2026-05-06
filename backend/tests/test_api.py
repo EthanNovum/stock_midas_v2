@@ -2433,6 +2433,10 @@ def test_create_report_supports_multiple_stocks_and_generated_klines(client):
         f"/api/v1/reports/{report_id}",
         json={
             "title": "更新后的多股票观点",
+            "stocks": [
+                {"symbol": "600001.SH", "name": "测试价值"},
+                {"symbol": "300001.SZ", "name": "测试成长"},
+            ],
             "rating": "hold",
             "date": "2026-04-22",
             "content": "更新后的正文",
@@ -2542,3 +2546,75 @@ def test_report_kline_uses_latest_trade_date_when_report_date_is_newer(client):
     assert [point["date"] for point in detail["klineSeries"][0]["klineData"]] == ["2026-04-30"]
     assert detail["klineSeries"][0]["latestClose"] is None
     assert detail["klineData"][0]["close"] == 11.49
+
+
+def test_reports_create_institution_and_include_in_options(client):
+    create_response = client.post("/api/v1/reports/institutions", json={"name": "测试新增机构"})
+
+    assert create_response.status_code == 201
+    assert create_response.json()["name"] == "测试新增机构"
+
+    list_response = client.get("/api/v1/reports")
+    assert list_response.status_code == 200
+    assert "测试新增机构" in list_response.json()["institutions"]
+
+
+def test_reports_create_institution_rejects_duplicate_name(client):
+    assert client.post("/api/v1/reports/institutions", json={"name": "中金公司"}).status_code == 400
+
+
+def test_reports_delete_report_removes_detail_and_list_entry(client):
+    initial = client.get("/api/v1/reports").json()["items"][0]
+    report_id = initial["id"]
+    institution = initial["institution"]
+
+    delete_response = client.delete(f"/api/v1/reports/{report_id}")
+
+    assert delete_response.status_code == 200
+    assert delete_response.json()["id"] == report_id
+    assert client.get(f"/api/v1/reports/{report_id}").status_code == 404
+    remaining = client.get(f"/api/v1/reports?institution={institution}").json()
+    assert all(item["id"] != report_id for item in remaining["items"])
+
+
+def test_reports_rename_institution_updates_rankings_and_details(client):
+    initial = client.get("/api/v1/reports").json()["items"][0]
+    source_institution = initial["institution"]
+    report_id = initial["id"]
+    target = f"{source_institution}研究"
+
+    response = client.patch(
+        "/api/v1/reports/institutions/name",
+        json={"institution": source_institution, "newName": target},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["institution"] == target
+
+    detail = client.get(f"/api/v1/reports/{report_id}").json()
+    assert detail["institution"] == target
+
+
+def test_reports_delete_institution_removes_all_related_reports(client):
+    target_item = next(
+        item for item in client.get("/api/v1/reports").json()["items"] if item["institution"] == "华泰证券"
+    )
+
+    delete_response = client.request("DELETE", "/api/v1/reports/institutions", json={"institution": "华泰证券"})
+
+    assert delete_response.status_code == 200
+    assert delete_response.json()["institution"] == "华泰证券"
+    assert delete_response.json()["reportCount"] == 1
+    assert client.get("/api/v1/reports?institution=华泰证券").json()["items"] == []
+    assert client.get(f"/api/v1/reports/{target_item['id']}").status_code == 404
+
+
+def test_reports_delete_institution_without_reports_still_succeeds(client):
+    create_response = client.post("/api/v1/reports/institutions", json={"name": "仅机构测试"})
+    assert create_response.status_code == 201
+
+    delete_response = client.request("DELETE", "/api/v1/reports/institutions", json={"institution": "仅机构测试"})
+    assert delete_response.status_code == 200
+    assert delete_response.json()["institution"] == "仅机构测试"
+    assert delete_response.json()["reportCount"] == 0

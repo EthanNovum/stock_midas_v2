@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime
 
@@ -25,6 +26,7 @@ def get_stock_detail(conn: sqlite3.Connection, symbol: str, range_name: str) -> 
             f.name,
             COALESCE(NULLIF(o.sector, ''), f.sector) AS sector,
             COALESCE(NULLIF(o.ownership, ''), f.ownership) AS ownership,
+            f.revenue_segments_json,
             f.pe_ttm,
             f.pb,
             f.market_cap,
@@ -52,6 +54,7 @@ def get_stock_detail(conn: sqlite3.Connection, symbol: str, range_name: str) -> 
         "name": stock["name"],
         "industry": stock["sector"],
         "ownership": stock["ownership"],
+        "mainBusiness": format_main_business(stock["revenue_segments_json"]),
         "latestPrice": latest["close"] if latest else None,
         "change": latest["close"] - latest["open"] if latest else None,
         "pctChange": latest["pct"] if latest else None,
@@ -122,6 +125,35 @@ def normalize_metadata_text(value: str | None) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def format_main_business(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        segments = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(segments, list):
+        return None
+
+    business_parts: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        name = str(segment.get("name") or "").strip()
+        if not name:
+            continue
+        percent_value = segment.get("revenue_percent")
+        if isinstance(percent_value, (int, float)):
+            percent_text = f"{percent_value:.2f}".rstrip("0").rstrip(".")
+            business_parts.append(f"{name} {percent_text}%")
+        else:
+            business_parts.append(name)
+
+    if not business_parts:
+        return None
+    return " / ".join(business_parts)
 
 
 def price_rows_for_range(conn: sqlite3.Connection, symbol: str, range_name: str) -> list[sqlite3.Row]:

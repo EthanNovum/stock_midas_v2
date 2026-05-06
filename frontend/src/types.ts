@@ -26,6 +26,7 @@ export interface StockDetailResponse {
   name: string;
   industry?: string | null;
   ownership?: string | null;
+  mainBusiness?: string | null;
   latestPrice?: number | null;
   change?: number | null;
   pctChange?: number | null;

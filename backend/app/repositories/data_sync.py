@@ -424,6 +424,7 @@ def to_job(row: sqlite3.Row) -> dict:
         "status": row["status"],
         "scopes": json.loads(row["scopes_json"]),
         "markets": json.loads(row["markets_json"]),
+        "symbols": json.loads(row["symbols_json"]) if row["symbols_json"] else [],
         "limit": row["limit_value"],
         "updateMode": row["update_mode"],
         "tradeDate": row["trade_date"],

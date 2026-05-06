@@ -1,7 +1,12 @@
 import os
+import random
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
-from typing import Any, Iterable
+from queue import Queue
+from typing import Any, Callable, Iterable, TypeVar
 
 import pandas as pd
 
@@ -17,29 +22,390 @@ SW_FIRST_INDUSTRY_BY_CODE_PREFIX = {
     "49": "非银金融",
 }
 
+T = TypeVar("T")
+
+
+class RetryableSyncError(RuntimeError):
+    pass
+
+
+class RateLimiter:
+    def __init__(self, default_rps: float, overrides: dict[str, float] | None = None):
+        self.default_rps = max(0.1, default_rps)
+        self.overrides = overrides or {}
+        self._next_allowed: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, bucket: str) -> None:
+        now = time.monotonic()
+        rps = max(0.1, self.overrides.get(bucket, self.default_rps))
+        interval = 1.0 / rps
+        with self._lock:
+            next_allowed = self._next_allowed.get(bucket, now)
+            wait_seconds = max(0.0, next_allowed - now)
+            self._next_allowed[bucket] = max(next_allowed, now) + interval
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+
+def env_int(name: str, default: int, min_value: int = 1) -> int:
+    try:
+        return max(min_value, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float, min_value: float = 0.1) -> float:
+    try:
+        return max(min_value, float(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def get_fetch_concurrency() -> int:
+    return env_int("MIDAS_AKSHARE_FETCH_CONCURRENCY", 4)
+
+
+def get_pipeline_queue_size() -> int:
+    return env_int("MIDAS_AKSHARE_PIPELINE_QUEUE_SIZE", 8)
+
+
+def get_retry_max_attempts() -> int:
+    return env_int("MIDAS_AKSHARE_RETRY_MAX_ATTEMPTS", 3)
+
+
+def get_retry_base_delay_ms() -> int:
+    return env_int("MIDAS_AKSHARE_RETRY_BASE_DELAY_MS", 300, min_value=50)
+
+
+def get_retry_max_delay_ms() -> int:
+    return env_int("MIDAS_AKSHARE_RETRY_MAX_DELAY_MS", 5000, min_value=100)
+
+
+def get_rate_limit_rps_default() -> float:
+    return env_float("MIDAS_AKSHARE_RATE_LIMIT_RPS", 5.0)
+
+
+def get_rate_limit_rps_overrides() -> dict[str, float]:
+    raw = os.getenv("MIDAS_AKSHARE_RATE_LIMIT_RPS_OVERRIDES", "").strip()
+    overrides: dict[str, float] = {}
+    if not raw:
+        return overrides
+    for chunk in raw.split(","):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            overrides[key] = max(0.1, float(value.strip()))
+        except ValueError:
+            continue
+    return overrides
+
+
+def retry_call(
+    fn: Callable[[], T],
+    *,
+    attempts: int,
+    base_delay_ms: int,
+    max_delay_ms: int,
+    should_retry: Callable[[Exception], bool] | None = None,
+) -> T:
+    effective_attempts = max(1, attempts)
+    for attempt in range(1, effective_attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            can_retry = attempt < effective_attempts and (should_retry(exc) if should_retry else True)
+            if not can_retry:
+                raise
+            backoff_ms = min(max_delay_ms, base_delay_ms * (2 ** (attempt - 1)))
+            jitter = random.uniform(0.7, 1.3)
+            time.sleep((backoff_ms * jitter) / 1000)
+    raise RuntimeError("unreachable")
+
+
+def should_retry_exception(exc: Exception) -> bool:
+    if isinstance(exc, RetryableSyncError):
+        return True
+    text = str(exc).lower()
+    retry_keywords = ("timeout", "timed out", "tempor", "连接", "reset", "429", "频率", "rate")
+    return any(keyword in text for keyword in retry_keywords)
+
+
+def concurrent_collect(
+    items: list[Any],
+    worker: Callable[[Any], T],
+    progress_callback,
+    message_prefix: str,
+) -> tuple[list[T], int]:
+    total = len(items)
+    if total == 0:
+        return [], 0
+
+    completed = 0
+    results: list[T] = []
+    errors = 0
+    max_workers = min(get_fetch_concurrency(), total)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker, item) for item in items]
+        for future in as_completed(futures):
+            completed += 1
+            try:
+                result = future.result()
+            except Exception:
+                errors += 1
+                notify_progress(progress_callback, completed, total, f"{message_prefix} {completed}/{total}")
+                continue
+            if result is not None:
+                results.append(result)
+            notify_progress(progress_callback, completed, total, f"{message_prefix} {completed}/{total}")
+    return results, errors
+
+
+def sync_config() -> dict[str, Any]:
+    return {
+        "retry_attempts": get_retry_max_attempts(),
+        "retry_base_delay_ms": get_retry_base_delay_ms(),
+        "retry_max_delay_ms": get_retry_max_delay_ms(),
+        "rate_limiter": RateLimiter(get_rate_limit_rps_default(), get_rate_limit_rps_overrides()),
+    }
+
+
+def guarded_ak_call(config: dict[str, Any], bucket: str, fn: Callable[[], T]) -> T:
+    limiter: RateLimiter = config["rate_limiter"]
+    limiter.acquire(bucket)
+    return retry_call(
+        fn,
+        attempts=int(config["retry_attempts"]),
+        base_delay_ms=int(config["retry_base_delay_ms"]),
+        max_delay_ms=int(config["retry_max_delay_ms"]),
+        should_retry=should_retry_exception,
+    )
+
 
 def run_sync(conn: sqlite3.Connection, request, progress_callback=None) -> tuple[int, int, str]:
+    config = sync_config()
+    timestamp = now_iso()
     if request.update_mode.value == "price_only":
-        updated = update_latest_prices(conn, request, now_iso(), progress_callback)
+        updated = update_latest_prices_pipeline(conn, request, timestamp, progress_callback, config)
         conn.commit()
         return updated, 0, f"现价更新完成，共写入 {updated} 条记录"
 
-    rows = list(fetch_akshare_rows(request, progress_callback))
-    if not rows:
-        raise RuntimeError("AkShare 未返回可写入的股票数据")
-
-    updated = upsert_stocks(conn, rows, now_iso())
+    updated = update_full_sync_pipeline(conn, request, timestamp, progress_callback, config)
     conn.commit()
     return updated, 0, f"全量真实行情数据更新完成，共写入 {updated} 条记录"
 
 
-def fetch_akshare_rows(request, progress_callback=None) -> Iterable[tuple]:
+def update_full_sync_pipeline(
+    conn: sqlite3.Connection,
+    request,
+    timestamp: str,
+    progress_callback=None,
+    config: dict[str, Any] | None = None,
+) -> int:
+    runtime = config or sync_config()
+    rows = list(fetch_akshare_rows(request, None))
+    if not rows:
+        raise RuntimeError("AkShare 未返回可写入的股票数据")
+
+    total = len(rows)
+    batch_size = max(1, min(200, get_sync_limit(request)))
+    queue_size = max(1, get_pipeline_queue_size())
+    queue: Queue[list[tuple] | None] = Queue(maxsize=queue_size)
+
+    def producer() -> None:
+        for start in range(0, total, batch_size):
+            queue.put(rows[start : start + batch_size])
+        queue.put(None)
+
+    producer_thread = threading.Thread(target=producer, daemon=True)
+    producer_thread.start()
+
+    updated = 0
+    persisted = 0
+    while True:
+        batch = queue.get()
+        if batch is None:
+            break
+        updated += upsert_stocks(conn, batch, timestamp)
+        persisted += len(batch)
+        notify_progress(progress_callback, persisted, total, f"正在全量更新 {persisted}/{total}")
+
+    producer_thread.join()
+    return updated
+
+
+def update_latest_prices_pipeline(
+    conn: sqlite3.Connection,
+    request,
+    timestamp: str,
+    progress_callback=None,
+    config: dict[str, Any] | None = None,
+) -> int:
     import akshare as ak
 
+    runtime = config or sync_config()
+    targets = get_price_update_targets(conn, request)
+    if not targets:
+        raise RuntimeError("仅更新现价需要先完成一次全量更新")
+
+    total = len(targets)
+    queue: Queue[dict[str, Any] | None] = Queue(maxsize=max(1, get_pipeline_queue_size() * 4))
+
+    def worker(stock: sqlite3.Row) -> dict[str, Any]:
+        code = strip_symbol(stock["symbol"])
+        hist = fetch_history(ak, code, request, runtime)
+        if hist is None or hist.empty or "收盘" not in hist.columns:
+            raise RuntimeError("history empty")
+
+        latest = hist.tail(1).iloc[0]
+        close = to_float(latest.get("收盘"))
+        if close <= 0:
+            raise RuntimeError("close invalid")
+
+        previous_close = close
+        if len(hist.index) >= 2:
+            previous_close = to_float(hist.tail(2).iloc[0].get("收盘"), default=close)
+
+        pct_change = compute_pct_change(close, previous_close, latest.get("涨跌幅"))
+        ma_fields = calculate_ma120_fields(close, to_float(stock["ma120"]))
+        return {
+            "symbol": stock["symbol"],
+            "latest_trade_date": latest_date_str(latest.get("日期"), request),
+            "open": to_float(latest.get("开盘"), default=close),
+            "close": close,
+            "high": to_float(latest.get("最高"), default=close),
+            "low": to_float(latest.get("最低"), default=close),
+            "volume": int(to_float(latest.get("成交量"), default=0)),
+            "amount": to_float(latest.get("成交额")),
+            "pct_change": pct_change,
+            "ma_fields": ma_fields,
+            "price_rows": history_price_rows(stock["symbol"], hist, request),
+        }
+
+    def producer() -> None:
+        with ThreadPoolExecutor(max_workers=min(get_fetch_concurrency(), total)) as executor:
+            futures = [executor.submit(worker, stock) for stock in targets]
+            for future in as_completed(futures):
+                try:
+                    payload = future.result()
+                except Exception:
+                    continue
+                queue.put(payload)
+        queue.put(None)
+
+    producer_thread = threading.Thread(target=producer, daemon=True)
+    producer_thread.start()
+
+    updated = 0
+    persisted = 0
+    while True:
+        payload = queue.get()
+        if payload is None:
+            break
+        conn.execute(
+            """
+            UPDATE stock_fundamentals
+            SET signal=?, ma120_lower=?, ma120_upper=?, updated_at=?
+            WHERE symbol=?
+            """,
+            (
+                payload["ma_fields"]["signal"],
+                payload["ma_fields"]["ma120_lower"],
+                payload["ma_fields"]["ma120_upper"],
+                timestamp,
+                payload["symbol"],
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO stock_daily_prices (
+                symbol, trade_date, open, close, high, low, volume, amount,
+                change, pct_change, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                open=excluded.open,
+                close=excluded.close,
+                high=excluded.high,
+                low=excluded.low,
+                volume=excluded.volume,
+                amount=excluded.amount,
+                change=excluded.change,
+                pct_change=excluded.pct_change,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["symbol"],
+                payload["latest_trade_date"],
+                payload["open"],
+                payload["close"],
+                payload["high"],
+                payload["low"],
+                payload["volume"],
+                payload["amount"],
+                payload["pct_change"],
+                payload["pct_change"],
+                timestamp,
+            ),
+        )
+        for price_row in payload["price_rows"]:
+            conn.execute(
+                """
+                INSERT INTO stock_daily_prices (
+                    symbol, trade_date, open, close, high, low, volume, amount,
+                    change, pct_change, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open=excluded.open,
+                    close=excluded.close,
+                    high=excluded.high,
+                    low=excluded.low,
+                    volume=excluded.volume,
+                    amount=excluded.amount,
+                    change=excluded.change,
+                    pct_change=excluded.pct_change,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    payload["symbol"],
+                    price_row["trade_date"],
+                    price_row["open"],
+                    price_row["close"],
+                    price_row["high"],
+                    price_row["low"],
+                    price_row["volume"],
+                    price_row["amount"],
+                    price_row["pct_change"],
+                    price_row["pct_change"],
+                    timestamp,
+                ),
+            )
+        persisted += 1
+        updated += 1 + max(1, len(payload["price_rows"]))
+        notify_progress(progress_callback, persisted, total, f"正在更新现价 {persisted}/{total}")
+
+    producer_thread.join()
+
+    if updated == 0:
+        raise RuntimeError("AkShare 未返回可写入的现价数据")
+
+    return updated
+
+
+def fetch_akshare_rows(request, progress_callback=None, config: dict[str, Any] | None = None) -> Iterable[tuple]:
+    import akshare as ak
+
+    runtime = config or sync_config()
+
     try:
-        spot = ak.stock_zh_a_spot_em()
+        spot = guarded_ak_call(runtime, "spot", lambda: ak.stock_zh_a_spot_em())
     except Exception as exc:
-        return fetch_rows_from_code_names(ak, request, exc, progress_callback)
+        return fetch_rows_from_code_names(ak, request, exc, progress_callback, runtime)
 
     if spot is None or spot.empty:
         return fetch_rows_from_code_names(
@@ -47,31 +413,21 @@ def fetch_akshare_rows(request, progress_callback=None) -> Iterable[tuple]:
             request,
             RuntimeError("AkShare 实时行情接口返回空数据"),
             progress_callback,
+            runtime,
         )
 
     selected = select_spot_rows(spot, request)
     sw_industry_lookup = build_sw_industry_lookup(
         ak,
         [normalize_symbol(str(item.get("代码", "")).strip()) for _, item in selected.iterrows() if str(item.get("代码", "")).strip()],
+        runtime,
     )
-    rows = []
-    history_errors = 0
-    total = len(selected.index)
+    spot_items = [item for _, item in selected.iterrows() if str(item.get("代码", "")).strip()]
 
-    for index, (_, item) in enumerate(selected.iterrows(), start=1):
-        code = str(item.get("代码", "")).strip()
-        if not code:
-            continue
+    def worker(item) -> tuple:
+        return convert_spot_row(item, request, ak, sw_industry_lookup, runtime)
 
-        try:
-            row = convert_spot_row(item, request, ak, sw_industry_lookup)
-        except Exception:
-            history_errors += 1
-            notify_progress(progress_callback, index, total, f"正在全量更新 {index}/{total}")
-            continue
-
-        rows.append(row)
-        notify_progress(progress_callback, index, total, f"正在全量更新 {index}/{total}")
+    rows, history_errors = concurrent_collect(spot_items, worker, progress_callback, "正在全量更新")
 
     if not rows:
         return fetch_rows_from_code_names(
@@ -79,30 +435,31 @@ def fetch_akshare_rows(request, progress_callback=None) -> Iterable[tuple]:
             request,
             RuntimeError(f"AkShare 快照行情可用，但日线行情不可用；失败 {history_errors} 条"),
             progress_callback,
+            runtime,
         )
 
     return rows
 
 
-def fetch_rows_from_code_names(ak: Any, request, cause: Exception, progress_callback=None) -> list[tuple]:
-    selected = select_code_name_rows(fetch_code_name_rows(ak, request), request)
+def fetch_rows_from_code_names(
+    ak: Any,
+    request,
+    cause: Exception,
+    progress_callback=None,
+    config: dict[str, Any] | None = None,
+) -> list[tuple]:
+    runtime = config or sync_config()
+    selected = select_code_name_rows(fetch_code_name_rows(ak, request, runtime), request)
     sw_industry_lookup = build_sw_industry_lookup(
         ak,
         [normalize_symbol(str(item["code"]).strip().zfill(6)) for item in selected if str(item["code"]).strip()],
+        runtime,
     )
-    rows = []
-    row_errors = 0
-    total = len(selected)
 
-    for index, item in enumerate(selected, start=1):
-        code = str(item["code"]).strip().zfill(6)
-        if not code:
-            continue
-        try:
-            rows.append(convert_code_name_row(item, request, ak, sw_industry_lookup))
-        except Exception:
-            row_errors += 1
-        notify_progress(progress_callback, index, total, f"正在全量更新 {index}/{total}")
+    def worker(item: dict[str, str]) -> tuple:
+        return convert_code_name_row(item, request, ak, sw_industry_lookup, runtime)
+
+    rows, row_errors = concurrent_collect(selected, worker, progress_callback, "正在全量更新")
 
     if not rows:
         raise RuntimeError(f"AkShare 备用真实数据接口不可用: {cause}; 失败 {row_errors} 条")
@@ -110,14 +467,16 @@ def fetch_rows_from_code_names(ak: Any, request, cause: Exception, progress_call
     return rows
 
 
-def fetch_code_name_rows(ak: Any, request) -> list[dict[str, str]]:
+def fetch_code_name_rows(ak: Any, request, config: dict[str, Any] | None = None) -> list[dict[str, str]]:
     if request.symbols:
         requested_codes = {strip_symbol(symbol).zfill(6) for symbol in request.symbols}
     else:
         requested_codes = set()
 
+    runtime = config or sync_config()
+
     try:
-        code_names = ak.stock_info_a_code_name()
+        code_names = guarded_ak_call(runtime, "code_name", lambda: ak.stock_info_a_code_name())
     except Exception:
         if not requested_codes:
             raise
@@ -164,11 +523,17 @@ def get_sync_limit(request=None) -> int:
         return 300
 
 
-def convert_spot_row(item, request, ak, sw_industry_lookup: dict[str, str] | None = None) -> tuple:
+def convert_spot_row(
+    item,
+    request,
+    ak,
+    sw_industry_lookup: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
+) -> tuple:
     code = str(item.get("代码", "")).strip()
     symbol = normalize_symbol(code)
     name = str(item.get("名称", code))
-    company_metadata = enrich_company_metadata(ak, code, fetch_company_metadata(ak, code), sw_industry_lookup)
+    company_metadata = enrich_company_metadata(ak, code, fetch_company_metadata(ak, code, config), sw_industry_lookup, config)
     price = to_float(item.get("最新价"))
     pct_change = to_float(item.get("涨跌幅"))
     market_cap = to_float(item.get("总市值")) / 100000000
@@ -176,7 +541,7 @@ def convert_spot_row(item, request, ak, sw_industry_lookup: dict[str, str] | Non
     pb = to_float(item.get("市净率"))
     dividend = to_float(item.get("股息率"))
     if market_cap <= 0 or pe <= 0 or pb <= 0 or dividend <= 0:
-        metrics = fetch_fundamental_metrics(ak, code)
+        metrics = fetch_fundamental_metrics(ak, code, config)
         market_cap = market_cap if market_cap > 0 else metrics.get("market_cap", 0.0)
         pe = pe if pe > 0 else metrics.get("pe", 0.0)
         pb = pb if pb > 0 else metrics.get("pb", 0.0)
@@ -187,7 +552,7 @@ def convert_spot_row(item, request, ak, sw_industry_lookup: dict[str, str] | Non
     volume = int(to_float(item.get("成交量"), default=0))
     amount = to_float(item.get("成交额"))
 
-    hist = fetch_history(ak, code, request)
+    hist = fetch_history(ak, code, request, config)
     if hist is None or hist.empty or "收盘" not in hist.columns:
         raise RuntimeError(f"{symbol} 日线为空")
 
@@ -209,8 +574,8 @@ def convert_spot_row(item, request, ak, sw_industry_lookup: dict[str, str] | Non
             pct_change = compute_pct_change(price, previous_close, latest.get("涨跌幅"))
     ma120 = round(float(closes.mean()), 2)
     if dividend <= 0:
-        dividend = fetch_dividend_yield(ak, code, price, trade_date)
-    revenue_segments = fetch_revenue_segments(ak, code)
+        dividend = fetch_dividend_yield(ak, code, price, trade_date, config)
+    revenue_segments = fetch_revenue_segments(ak, code, config)
 
     return (
         symbol,
@@ -245,12 +610,13 @@ def convert_code_name_row(
     request,
     ak,
     sw_industry_lookup: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> tuple:
     code = item["code"]
     symbol = normalize_symbol(code)
     name = item["name"]
-    company_metadata = enrich_company_metadata(ak, code, fetch_company_metadata(ak, code), sw_industry_lookup)
-    hist = fetch_history(ak, code, request)
+    company_metadata = enrich_company_metadata(ak, code, fetch_company_metadata(ak, code, config), sw_industry_lookup, config)
+    hist = fetch_history(ak, code, request, config)
     if hist is None or hist.empty or "收盘" not in hist.columns:
         raise RuntimeError(f"{symbol} 日线为空")
 
@@ -268,7 +634,7 @@ def convert_code_name_row(
     if closes.empty:
         raise RuntimeError(f"{symbol} 收盘价为空")
 
-    metrics = fetch_fundamental_metrics(ak, code)
+    metrics = fetch_fundamental_metrics(ak, code, config)
     open_price = to_float(latest.get("开盘"), default=close)
     high = to_float(latest.get("最高"), default=max(close, open_price))
     low = to_float(latest.get("最低"), default=min(close, open_price))
@@ -278,8 +644,8 @@ def convert_code_name_row(
     dividend = metrics.get("dividend", 0.0)
     trade_date = latest_date_str(latest.get("日期"), request)
     if to_float(dividend) <= 0:
-        dividend = fetch_dividend_yield(ak, code, close, trade_date)
-    revenue_segments = fetch_revenue_segments(ak, code)
+        dividend = fetch_dividend_yield(ak, code, close, trade_date, config)
+    revenue_segments = fetch_revenue_segments(ak, code, config)
 
     return (
         symbol,
@@ -314,6 +680,7 @@ def enrich_company_metadata(
     code: str,
     company_metadata: dict[str, str],
     sw_industry_lookup: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     symbol = normalize_symbol(code)
     sw_industry = (sw_industry_lookup or {}).get(symbol, "未知")
@@ -321,14 +688,15 @@ def enrich_company_metadata(
         company_metadata["sector"] = sw_industry
 
     if company_metadata.get("ownership") == "未知":
-        company_metadata["ownership"] = infer_ownership_from_shareholders(ak, code)
+        company_metadata["ownership"] = infer_ownership_from_shareholders(ak, code, config)
 
     return company_metadata
 
 
-def infer_ownership_from_shareholders(ak: Any, code: str) -> str:
+def infer_ownership_from_shareholders(ak: Any, code: str, config: dict[str, Any] | None = None) -> str:
+    runtime = config or sync_config()
     try:
-        frame = ak.stock_main_stock_holder(stock=code)
+        frame = guarded_ak_call(runtime, "holder", lambda: ak.stock_main_stock_holder(stock=code))
     except Exception:
         return "未知"
     if frame is None or frame.empty or "股东名称" not in frame.columns:
@@ -355,14 +723,15 @@ def classify_ownership_from_text(value: object) -> str:
     return normalize_company_ownership(text, text)
 
 
-def build_sw_industry_lookup(ak: Any, symbols: list[str]) -> dict[str, str]:
+def build_sw_industry_lookup(ak: Any, symbols: list[str], config: dict[str, Any] | None = None) -> dict[str, str]:
     targets = {symbol.upper(): strip_symbol(symbol).zfill(6) for symbol in symbols}
     lookup = {symbol: "未知" for symbol in targets}
     if not targets:
         return lookup
 
+    runtime = config or sync_config()
     try:
-        history = ak.stock_industry_clf_hist_sw()
+        history = guarded_ak_call(runtime, "industry", lambda: ak.stock_industry_clf_hist_sw())
     except Exception:
         return lookup
     if history is None or history.empty or not {"symbol", "industry_code", "start_date"}.issubset(set(history.columns)):
@@ -380,9 +749,14 @@ def build_sw_industry_lookup(ak: Any, symbols: list[str]) -> dict[str, str]:
     return lookup
 
 
-def fetch_revenue_segments(ak: Any, code: str) -> list[dict[str, float | str]]:
+def fetch_revenue_segments(ak: Any, code: str, config: dict[str, Any] | None = None) -> list[dict[str, float | str]]:
+    runtime = config or sync_config()
     try:
-        frame = ak.stock_zygc_em(symbol=market_prefixed_code(strip_symbol(code).zfill(6)).upper())
+        frame = guarded_ak_call(
+            runtime,
+            "revenue",
+            lambda: ak.stock_zygc_em(symbol=market_prefixed_code(strip_symbol(code).zfill(6)).upper()),
+        )
     except Exception:
         return []
     return extract_top_revenue_segments(frame)
@@ -421,9 +795,16 @@ def extract_top_revenue_segments(frame: pd.DataFrame, top: int = 3) -> list[dict
     return segments
 
 
-def fetch_dividend_yield(ak: Any, code: str, close: float, trade_date: str) -> float:
+def fetch_dividend_yield(
+    ak: Any,
+    code: str,
+    close: float,
+    trade_date: str,
+    config: dict[str, Any] | None = None,
+) -> float:
+    runtime = config or sync_config()
     try:
-        frame = ak.stock_dividend_cninfo(symbol=code)
+        frame = guarded_ak_call(runtime, "dividend", lambda: ak.stock_dividend_cninfo(symbol=code))
     except Exception:
         return 0.0
     return compute_dividend_yield_from_cninfo(frame, close, trade_date)
@@ -453,27 +834,30 @@ def compute_dividend_yield_from_cninfo(frame: pd.DataFrame, close: float, trade_
     return round(dividend_per_share / close * 100, 2)
 
 
-def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, progress_callback=None) -> int:
+def update_latest_prices(
+    conn: sqlite3.Connection,
+    request,
+    timestamp: str,
+    progress_callback=None,
+    config: dict[str, Any] | None = None,
+) -> int:
     import akshare as ak
 
+    runtime = config or sync_config()
     targets = get_price_update_targets(conn, request)
     if not targets:
         raise RuntimeError("仅更新现价需要先完成一次全量更新")
 
-    updated = 0
-    total = len(targets)
-    for index, stock in enumerate(targets, start=1):
+    def worker(stock: sqlite3.Row) -> dict[str, Any]:
         code = strip_symbol(stock["symbol"])
-        hist = fetch_history(ak, code, request)
+        hist = fetch_history(ak, code, request, runtime)
         if hist is None or hist.empty or "收盘" not in hist.columns:
-            notify_progress(progress_callback, index, total, f"正在更新现价 {index}/{total}")
-            continue
+            raise RuntimeError("history empty")
 
         latest = hist.tail(1).iloc[0]
         close = to_float(latest.get("收盘"))
         if close <= 0:
-            notify_progress(progress_callback, index, total, f"正在更新现价 {index}/{total}")
-            continue
+            raise RuntimeError("close invalid")
 
         previous_close = close
         if len(hist.index) >= 2:
@@ -481,7 +865,24 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
 
         pct_change = compute_pct_change(close, previous_close, latest.get("涨跌幅"))
         ma_fields = calculate_ma120_fields(close, to_float(stock["ma120"]))
-        price_rows = history_price_rows(stock["symbol"], hist, request)
+        return {
+            "symbol": stock["symbol"],
+            "latest_trade_date": latest_date_str(latest.get("日期"), request),
+            "open": to_float(latest.get("开盘"), default=close),
+            "close": close,
+            "high": to_float(latest.get("最高"), default=close),
+            "low": to_float(latest.get("最低"), default=close),
+            "volume": int(to_float(latest.get("成交量"), default=0)),
+            "amount": to_float(latest.get("成交额")),
+            "pct_change": pct_change,
+            "ma_fields": ma_fields,
+            "price_rows": history_price_rows(stock["symbol"], hist, request),
+        }
+
+    payloads, _ = concurrent_collect(list(targets), worker, progress_callback, "正在更新现价")
+
+    updated = 0
+    for payload in payloads:
         conn.execute(
             """
             UPDATE stock_fundamentals
@@ -489,11 +890,11 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
             WHERE symbol=?
             """,
             (
-                ma_fields["signal"],
-                ma_fields["ma120_lower"],
-                ma_fields["ma120_upper"],
+                payload["ma_fields"]["signal"],
+                payload["ma_fields"]["ma120_lower"],
+                payload["ma_fields"]["ma120_upper"],
                 timestamp,
-                stock["symbol"],
+                payload["symbol"],
             ),
         )
         conn.execute(
@@ -515,20 +916,20 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
                 updated_at=excluded.updated_at
             """,
             (
-                stock["symbol"],
-                latest_date_str(latest.get("日期"), request),
-                to_float(latest.get("开盘"), default=close),
-                close,
-                to_float(latest.get("最高"), default=close),
-                to_float(latest.get("最低"), default=close),
-                int(to_float(latest.get("成交量"), default=0)),
-                to_float(latest.get("成交额")),
-                pct_change,
-                pct_change,
+                payload["symbol"],
+                payload["latest_trade_date"],
+                payload["open"],
+                payload["close"],
+                payload["high"],
+                payload["low"],
+                payload["volume"],
+                payload["amount"],
+                payload["pct_change"],
+                payload["pct_change"],
                 timestamp,
             ),
         )
-        for price_row in price_rows:
+        for price_row in payload["price_rows"]:
             conn.execute(
                 """
                 INSERT INTO stock_daily_prices (
@@ -548,7 +949,7 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
                     updated_at=excluded.updated_at
                 """,
                 (
-                    stock["symbol"],
+                    payload["symbol"],
                     price_row["trade_date"],
                     price_row["open"],
                     price_row["close"],
@@ -561,8 +962,7 @@ def update_latest_prices(conn: sqlite3.Connection, request, timestamp: str, prog
                     timestamp,
                 ),
             )
-        updated += 1 + max(1, len(price_rows))
-        notify_progress(progress_callback, index, total, f"正在更新现价 {index}/{total}")
+        updated += 1 + max(1, len(payload["price_rows"]))
 
     if updated == 0:
         raise RuntimeError("AkShare 未返回可写入的现价数据")
@@ -593,9 +993,9 @@ def get_price_update_targets(conn: sqlite3.Connection, request) -> list[sqlite3.
     return list(rows)
 
 
-def fetch_company_metadata(ak: Any, code: str) -> dict[str, str]:
-    profile_values = fetch_cninfo_profile_values(ak, code)
-    xueqiu_values = fetch_xueqiu_basic_values(ak, code)
+def fetch_company_metadata(ak: Any, code: str, config: dict[str, Any] | None = None) -> dict[str, str]:
+    profile_values = fetch_cninfo_profile_values(ak, code, config)
+    xueqiu_values = fetch_xueqiu_basic_values(ak, code, config)
 
     symbol = normalize_symbol(code)
     return {
@@ -608,9 +1008,10 @@ def fetch_company_metadata(ak: Any, code: str) -> dict[str, str]:
     }
 
 
-def fetch_cninfo_profile_values(ak: Any, code: str) -> dict[str, Any]:
+def fetch_cninfo_profile_values(ak: Any, code: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime = config or sync_config()
     try:
-        frame = ak.stock_profile_cninfo(symbol=code)
+        frame = guarded_ak_call(runtime, "profile", lambda: ak.stock_profile_cninfo(symbol=code))
     except Exception:
         return {}
 
@@ -621,9 +1022,14 @@ def fetch_cninfo_profile_values(ak: Any, code: str) -> dict[str, Any]:
     return {str(key): row.get(key) for key in frame.columns}
 
 
-def fetch_xueqiu_basic_values(ak: Any, code: str) -> dict[str, Any]:
+def fetch_xueqiu_basic_values(ak: Any, code: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime = config or sync_config()
     try:
-        frame = ak.stock_individual_basic_info_xq(symbol=xueqiu_symbol(code), timeout=8)
+        frame = guarded_ak_call(
+            runtime,
+            "xueqiu",
+            lambda: ak.stock_individual_basic_info_xq(symbol=xueqiu_symbol(code), timeout=8),
+        )
     except Exception:
         return {}
 
@@ -670,10 +1076,11 @@ def looks_like_private_controller(text: str) -> bool:
     return 2 <= len(chinese_chars) <= 8
 
 
-def fetch_fundamental_metrics(ak: Any, code: str) -> dict[str, Any]:
+def fetch_fundamental_metrics(ak: Any, code: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime = config or sync_config()
     metrics: dict[str, Any] = {}
     try:
-        info = ak.stock_individual_info_em(symbol=code, timeout=8)
+        info = guarded_ak_call(runtime, "fundamental", lambda: ak.stock_individual_info_em(symbol=code, timeout=8))
     except Exception:
         info = None
 
@@ -689,7 +1096,7 @@ def fetch_fundamental_metrics(ak: Any, code: str) -> dict[str, Any]:
         }
 
     if any(to_float(metrics.get(key)) <= 0 for key in ("market_cap", "pe", "pb", "dividend")):
-        value_metrics = fetch_value_metrics(ak, code)
+        value_metrics = fetch_value_metrics(ak, code, runtime)
         for key, value in value_metrics.items():
             if to_float(metrics.get(key)) <= 0 and to_float(value) > 0:
                 metrics[key] = value
@@ -697,9 +1104,10 @@ def fetch_fundamental_metrics(ak: Any, code: str) -> dict[str, Any]:
     return metrics
 
 
-def fetch_value_metrics(ak: Any, code: str) -> dict[str, float]:
+def fetch_value_metrics(ak: Any, code: str, config: dict[str, Any] | None = None) -> dict[str, float]:
+    runtime = config or sync_config()
     try:
-        frame = ak.stock_value_em(symbol=code)
+        frame = guarded_ak_call(runtime, "value", lambda: ak.stock_value_em(symbol=code))
     except Exception:
         return {}
 
@@ -732,11 +1140,16 @@ def normalize_market_cap_yi(value: object) -> float:
     return round(amount, 2)
 
 
-def fetch_history(ak, code: str, request):
+def fetch_history(ak, code: str, request, config: dict[str, Any] | None = None):
+    runtime = config or sync_config()
     errors = []
-    for fetcher in (fetch_history_tx, fetch_history_sina, fetch_history_eastmoney):
+    for fetcher, bucket in (
+        (fetch_history_tx, "history_tx"),
+        (fetch_history_sina, "history_sina"),
+        (fetch_history_eastmoney, "history_em"),
+    ):
         try:
-            hist = fetcher(ak, code, request)
+            hist = guarded_ak_call(runtime, bucket, lambda fetcher=fetcher: fetcher(ak, code, request))
         except Exception as exc:
             errors.append(f"{fetcher.__name__}: {exc}")
             continue

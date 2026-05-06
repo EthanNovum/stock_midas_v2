@@ -10,6 +10,7 @@ import {
   Pencil,
   Plus,
   Search,
+  Trash2,
   Trophy,
   Upload,
   X
@@ -73,6 +74,15 @@ interface InstitutionRanking {
   winRate: number;
 }
 
+interface InstitutionEditorState {
+  originalName: string;
+  name: string;
+}
+
+interface InstitutionCreateState {
+  name: string;
+}
+
 interface SearchResultItem {
   type: string;
   id: string;
@@ -98,6 +108,7 @@ interface UploadedFileState {
 interface ReportsProps {
   stockFilter: StockRef | null;
   onClearStockFilter: () => void;
+  onOpenStockDetail: (stock: StockRef) => void;
 }
 
 const getTodayDateValue = () => {
@@ -208,6 +219,15 @@ const KlineChart: React.FC<{ series: KlineSeries | null }> = ({ series }) => {
     const startClose = series.startClose ?? firstPoint.close;
     const latestClose = series.latestClose ?? latestPoint.close;
     const changePct = series.changePct ?? (startClose ? ((latestClose - startClose) / startClose) * 100 : null);
+
+    let peak = data[0].close;
+    let maxDrawdown = 0;
+    for (const point of data) {
+      if (point.close > peak) peak = point.close;
+      const drawdown = peak ? (peak - point.close) / peak : 0;
+      if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+    }
+
     return {
       firstPoint,
       latestPoint,
@@ -216,6 +236,7 @@ const KlineChart: React.FC<{ series: KlineSeries | null }> = ({ series }) => {
       startClose,
       latestClose,
       changePct,
+      maxDrawdownPct: maxDrawdown * 100,
     };
   }, [data, series]);
 
@@ -237,7 +258,7 @@ const KlineChart: React.FC<{ series: KlineSeries | null }> = ({ series }) => {
               <span className="font-mono text-sm font-black text-on-surface-variant">{series.symbol}</span>
               <VerdictIcon verdict={series.verdict ?? 'flat'} label={series.name} compact />
             </div>
-            <div className="mt-3 grid grid-cols-3 gap-3 text-center md:max-w-xl">
+            <div className="mt-3 grid grid-cols-2 gap-3 text-center md:max-w-xl md:grid-cols-4">
               <div>
                 <p className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">起始收盘</p>
                 <p className="mt-1 font-mono text-lg font-black text-primary">{formatPrice(rangeStats.startClose)}</p>
@@ -249,6 +270,10 @@ const KlineChart: React.FC<{ series: KlineSeries | null }> = ({ series }) => {
               <div>
                 <p className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">期间最低</p>
                 <p className="mt-1 font-mono text-lg font-black text-tertiary-container">{formatPrice(rangeStats.lowPoint.low)}</p>
+              </div>
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">最大回撤</p>
+                <p className="mt-1 font-mono text-lg font-black text-tertiary-container">-{Math.abs(rangeStats.maxDrawdownPct).toFixed(2)}%</p>
               </div>
             </div>
           </div>
@@ -269,7 +294,7 @@ const KlineChart: React.FC<{ series: KlineSeries | null }> = ({ series }) => {
   );
 };
 
-export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilter }) => {
+export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilter, onOpenStockDetail }) => {
   const [reports, setReports] = useState<ResearchReportListItem[]>([]);
   const [institutions, setInstitutions] = useState<string[]>([]);
   const [institutionRankings, setInstitutionRankings] = useState<InstitutionRanking[]>([]);
@@ -291,7 +316,14 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
   const [isSaving, setIsSaving] = useState(false);
   const [editingVerdictSymbol, setEditingVerdictSymbol] = useState<string | null>(null);
   const [isUpdatingVerdict, setIsUpdatingVerdict] = useState(false);
+  const [editingInstitution, setEditingInstitution] = useState<InstitutionEditorState | null>(null);
+  const [creatingInstitution, setCreatingInstitution] = useState<InstitutionCreateState | null>(null);
+  const [deletingInstitution, setDeletingInstitution] = useState<InstitutionRanking | null>(null);
+  const [deletingReport, setDeletingReport] = useState<ResearchReportDetail | null>(null);
+  const [isMutatingInstitution, setIsMutatingInstitution] = useState(false);
+  const [isDeletingReport, setIsDeletingReport] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [reportFormError, setReportFormError] = useState<string | null>(null);
 
   const activeSeries = useMemo(() => {
     if (!selectedReport) return null;
@@ -399,19 +431,23 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
   }, [isCreateOpen, stockInput]);
 
   const openCreateDialog = () => {
+    const latestReportDate = reports[0]?.date ?? getTodayDateValue();
     setEditingReportId(null);
-    setForm(createEmptyForm());
+    setForm({
+      ...createEmptyForm(),
+      date: latestReportDate,
+    });
     setSelectedStocks([]);
     setStockInput('');
     setUploadedFile(null);
     setMessage(null);
+    setReportFormError(null);
     setIsCreateOpen(true);
-  };
-
-  const openEditDialog = () => {
+  };  const openEditDialog = () => {
     if (!selectedReport) return;
     setIsCreateOpen(false);
     setEditingReportId(selectedReport.id);
+    setReportFormError(null);
     setForm({
       title: selectedReport.title,
       institution: selectedReport.institution,
@@ -433,8 +469,8 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
     setStockInput('');
     setStockSearchResults([]);
     setUploadedFile(null);
+    setReportFormError(null);
   };
-
   const addStock = (item: SearchResultItem) => {
     if (selectedStocks.some((stock) => stock.symbol === item.id)) return;
     setSelectedStocks((stocks) => [...stocks, { symbol: item.id, name: item.title, verdict: 'flat' }]);
@@ -460,7 +496,8 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
 
   const submitReport = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!isEditOpen && !selectedStocks.length) {
+    setReportFormError(null);
+    if (!selectedStocks.length) {
       setMessage('请至少选择一只相关股票');
       return;
     }
@@ -469,7 +506,7 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
       return;
     }
     if (!isEditOpen && !form.institution.trim()) {
-      setMessage('请填写观点方');
+      setReportFormError('请填写观点方后再保存研报');
       return;
     }
     if (!form.content.trim()) {
@@ -485,6 +522,7 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
         body: JSON.stringify(isEditOpen
           ? {
               title: form.title.trim(),
+              stocks: selectedStocks,
               rating: form.rating,
               date: form.date,
               content: form.content.trim(),
@@ -551,6 +589,111 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
     }
   };
 
+  const submitInstitutionCreate = async () => {
+    if (!creatingInstitution) return;
+    const name = creatingInstitution.name.trim();
+    if (!name) {
+      setMessage('机构名称不能为空');
+      return;
+    }
+
+    setIsMutatingInstitution(true);
+    try {
+      const response = await fetch('/api/v1/reports/institutions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!response.ok) throw new Error(await readErrorMessage(response));
+      await loadReports();
+      setCreatingInstitution(null);
+      setMessage('机构已新增');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '新增机构失败');
+    } finally {
+      setIsMutatingInstitution(false);
+    }
+  };
+
+  const submitInstitutionRename = async () => {
+    if (!editingInstitution) return;
+    const newName = editingInstitution.name.trim();
+    if (!newName) {
+      setMessage('机构名称不能为空');
+      return;
+    }
+    if (newName === editingInstitution.originalName) {
+      setEditingInstitution(null);
+      return;
+    }
+
+    setIsMutatingInstitution(true);
+    try {
+      const response = await fetch('/api/v1/reports/institutions/name', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ institution: editingInstitution.originalName, newName }),
+      });
+      if (!response.ok) throw new Error(await readErrorMessage(response));
+      await loadReports();
+      setSelectedReport((report) => report && report.institution === editingInstitution.originalName
+        ? { ...report, institution: newName }
+        : report);
+      setEditingInstitution(null);
+      setMessage('机构名称已更新');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '机构名称更新失败');
+    } finally {
+      setIsMutatingInstitution(false);
+    }
+  };
+
+  const confirmDeleteInstitution = async () => {
+    if (!deletingInstitution) return;
+    setIsMutatingInstitution(true);
+    try {
+      const response = await fetch('/api/v1/reports/institutions', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ institution: deletingInstitution.institution }),
+      });
+      if (!response.ok) throw new Error(await readErrorMessage(response));
+      const deletedInstitution = deletingInstitution.institution;
+      setDeletingInstitution(null);
+      if (selectedReport?.institution === deletedInstitution) {
+        setSelectedReportId(null);
+        setSelectedReport(null);
+      }
+      await loadReports();
+      setMessage('机构及其研报已删除');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '机构删除失败');
+    } finally {
+      setIsMutatingInstitution(false);
+    }
+  };
+
+  const confirmDeleteReport = async () => {
+    if (!deletingReport) return;
+    setIsDeletingReport(true);
+    try {
+      const response = await fetch(`/api/v1/reports/${deletingReport.id}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await readErrorMessage(response));
+      const deletedReportId = deletingReport.id;
+      setDeletingReport(null);
+      if (selectedReportId === deletedReportId) {
+        setSelectedReportId(null);
+        setSelectedReport(null);
+      }
+      await loadReports();
+      setMessage('研报已删除');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '研报删除失败');
+    } finally {
+      setIsDeletingReport(false);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto space-y-8">
       <div className="flex flex-col md:flex-row md:justify-between md:items-end gap-5">
@@ -597,14 +740,24 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
       )}
 
       <section className="rounded-2xl border border-outline-variant/10 bg-surface-container-lowest p-4 shadow-sm">
-        <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-end md:justify-between">
+        <div className="mb-3 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
             <h2 className="text-lg font-[900] font-headline text-primary">观点方胜率排行</h2>
             <p className="mt-1 text-xs font-bold text-on-surface-variant">胜率 = 胜利标的数 / 研报提到标的数</p>
           </div>
-          <span className="text-xs font-black text-on-surface-variant">
-            {institutionRankings.length} 个观点方
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-black text-on-surface-variant">
+              {institutionRankings.length} 个观点方
+            </span>
+            <button
+              type="button"
+              onClick={() => setCreatingInstitution({ name: '' })}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-3 py-2 text-xs font-black text-surface"
+            >
+              <Plus size={14} strokeWidth={3} />
+              新增观点方
+            </button>
+          </div>
         </div>
         {institutionRankings.length === 0 ? (
           <div className="rounded-xl bg-surface-container-low px-4 py-5 text-sm font-bold text-on-surface-variant">
@@ -620,6 +773,7 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
                   <th className="w-28 px-3 py-2 text-right">胜率</th>
                   <th className="w-28 px-3 py-2 text-right">胜利/标的</th>
                   <th className="w-24 px-3 py-2 text-right">研报</th>
+                  <th className="w-32 px-3 py-2 text-right">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-outline-variant/10">
@@ -650,6 +804,26 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
                     <td className="px-3 py-2 text-right font-mono text-xs font-black text-on-surface-variant">
                       {ranking.reportCount}
                     </td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center justify-end gap-1.5" onClick={(event) => event.stopPropagation()}>
+                        <button
+                          type="button"
+                          onClick={() => setEditingInstitution({ originalName: ranking.institution, name: ranking.institution })}
+                          className="inline-flex items-center justify-center rounded-lg border border-outline-variant/20 bg-surface-container-low px-2 py-1 text-primary hover:bg-surface-container"
+                          title={`编辑 ${ranking.institution}`}
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeletingInstitution(ranking)}
+                          className="inline-flex items-center justify-center rounded-lg border border-tertiary-container/20 bg-tertiary-container/10 px-2 py-1 text-tertiary-container hover:bg-tertiary-container/20"
+                          title={`删除 ${ranking.institution}`}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -670,6 +844,16 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
                 placeholder="搜索研报、机构或代码..."
                 className="bg-transparent border-none outline-none text-sm w-full"
               />
+              {query.trim() && (
+                <button
+                  type="button"
+                  onClick={() => setQuery('')}
+                  aria-label="清空搜索"
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-md text-on-surface-variant hover:bg-surface-container-low hover:text-primary"
+                >
+                  <X size={14} />
+                </button>
+              )}
             </div>
             <select
               value={institutionFilter}
@@ -757,14 +941,24 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
                   </h2>
                 </div>
                 <div className="flex shrink-0 flex-col items-start gap-3 md:items-end md:text-right">
-                  <button
-                    type="button"
-                    onClick={openEditDialog}
-                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-black text-surface transition-transform hover:scale-[1.01] active:scale-95"
-                  >
-                    <Pencil size={16} strokeWidth={3} />
-                    编辑
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={openEditDialog}
+                      className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-black text-surface transition-transform hover:scale-[1.01] active:scale-95"
+                    >
+                      <Pencil size={16} strokeWidth={3} />
+                      编辑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeletingReport(selectedReport)}
+                      className="inline-flex items-center justify-center gap-2 rounded-xl bg-tertiary-container px-4 py-2 text-sm font-black text-surface transition-transform hover:scale-[1.01] active:scale-95"
+                    >
+                      <Trash2 size={16} strokeWidth={3} />
+                      删除
+                    </button>
+                  </div>
                   <div>
                     <p className="text-xs font-black text-on-surface-variant uppercase tracking-[0.2em] mb-1">{selectedReport.institution}</p>
                     <p className="text-sm font-bold text-primary">{selectedReport.date}</p>
@@ -775,7 +969,17 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
               <div className="mt-8 space-y-5">
                 <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
                   <h5 className="text-[10px] font-black text-primary uppercase tracking-[0.2em]">发布日起行情走势</h5>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {activeSeries && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenStockDetail({ symbol: activeSeries.symbol, name: activeSeries.name })}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-primary px-3 py-2 text-xs font-black text-surface hover:scale-[1.01] active:scale-95 transition-transform"
+                      >
+                        查看详情
+                        <ChevronRight size={14} strokeWidth={3} />
+                      </button>
+                    )}
                     {selectedReport.klineSeries.map((series) => (
                       <div
                         key={series.symbol}
@@ -888,6 +1092,192 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
         </div>
       </div>
 
+      {creatingInstitution && (
+        <div className="fixed inset-0 z-50 bg-primary/30 backdrop-blur-sm flex items-center justify-center p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="institution-create-dialog-title"
+            className="w-full max-w-md rounded-[2rem] bg-surface-container-lowest p-6 shadow-2xl border border-outline-variant/20 space-y-5"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 id="institution-create-dialog-title" className="text-2xl font-[900] font-headline text-primary">新增观点方</h2>
+                <p className="mt-1 text-sm font-medium text-on-surface-variant">新增后可在新建研报时直接选择。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCreatingInstitution(null)}
+                className="p-2 rounded-xl hover:bg-surface-container-low text-primary"
+                aria-label="关闭新增机构弹窗"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <label className="space-y-2 block">
+              <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">机构名称</span>
+              <input
+                type="text"
+                value={creatingInstitution.name}
+                onChange={(event) => setCreatingInstitution((state) => state ? { ...state, name: event.target.value } : state)}
+                className="w-full rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 text-sm font-bold outline-none focus:border-primary"
+                placeholder="请输入机构名称"
+              />
+            </label>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setCreatingInstitution(null)}
+                className="px-4 py-2 rounded-xl bg-surface-container-low text-primary text-sm font-black hover:bg-surface-container"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={isMutatingInstitution}
+                onClick={() => void submitInstitutionCreate()}
+                className="px-4 py-2 rounded-xl bg-primary text-surface text-sm font-black disabled:opacity-60"
+              >
+                {isMutatingInstitution ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editingInstitution && (
+        <div className="fixed inset-0 z-50 bg-primary/30 backdrop-blur-sm flex items-center justify-center p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="institution-edit-dialog-title"
+            className="w-full max-w-md rounded-[2rem] bg-surface-container-lowest p-6 shadow-2xl border border-outline-variant/20 space-y-5"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 id="institution-edit-dialog-title" className="text-2xl font-[900] font-headline text-primary">编辑机构名称</h2>
+                <p className="mt-1 text-sm font-medium text-on-surface-variant">仅修改机构名称，历史统计将自动同步。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingInstitution(null)}
+                className="p-2 rounded-xl hover:bg-surface-container-low text-primary"
+                aria-label="关闭编辑机构弹窗"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <label className="space-y-2 block">
+              <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">机构名称</span>
+              <input
+                type="text"
+                value={editingInstitution.name}
+                onChange={(event) => setEditingInstitution((state) => state ? { ...state, name: event.target.value } : state)}
+                className="w-full rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 text-sm font-bold outline-none focus:border-primary"
+                placeholder="请输入机构名称"
+              />
+            </label>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setEditingInstitution(null)}
+                className="px-4 py-2 rounded-xl bg-surface-container-low text-primary text-sm font-black hover:bg-surface-container"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={isMutatingInstitution}
+                onClick={() => void submitInstitutionRename()}
+                className="px-4 py-2 rounded-xl bg-primary text-surface text-sm font-black disabled:opacity-60"
+              >
+                {isMutatingInstitution ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deletingInstitution && (
+        <div className="fixed inset-0 z-50 bg-primary/30 backdrop-blur-sm flex items-center justify-center p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="institution-delete-dialog-title"
+            className="w-full max-w-md rounded-[2rem] bg-surface-container-lowest p-6 shadow-2xl border border-outline-variant/20 space-y-5"
+          >
+            <div>
+              <h2 id="institution-delete-dialog-title" className="text-2xl font-[900] font-headline text-primary">确认删除机构</h2>
+              <p className="mt-2 text-sm font-medium text-on-surface-variant">
+                删除后会移除该机构下所有研报与关联行情记录，且无法恢复。
+              </p>
+            </div>
+            <div className="rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 space-y-1.5">
+              <p className="text-sm font-black text-primary">{deletingInstitution.institution}</p>
+              <p className="text-xs font-bold text-on-surface-variant">胜率：{deletingInstitution.winRate.toFixed(1)}%</p>
+              <p className="text-xs font-bold text-on-surface-variant">研报数量：{deletingInstitution.reportCount}</p>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setDeletingInstitution(null)}
+                className="px-4 py-2 rounded-xl bg-surface-container-low text-primary text-sm font-black hover:bg-surface-container"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={isMutatingInstitution}
+                onClick={() => void confirmDeleteInstitution()}
+                className="px-4 py-2 rounded-xl bg-tertiary-container text-surface text-sm font-black disabled:opacity-60"
+              >
+                {isMutatingInstitution ? '删除中...' : '确认删除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deletingReport && (
+        <div className="fixed inset-0 z-50 bg-primary/30 backdrop-blur-sm flex items-center justify-center p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="report-delete-dialog-title"
+            className="w-full max-w-md rounded-[2rem] bg-surface-container-lowest p-6 shadow-2xl border border-outline-variant/20 space-y-5"
+          >
+            <div>
+              <h2 id="report-delete-dialog-title" className="text-2xl font-[900] font-headline text-primary">确认删除研报</h2>
+              <p className="mt-2 text-sm font-medium text-on-surface-variant">
+                删除后该研报及关联标的标记、历史行情快照将被移除，且无法恢复。
+              </p>
+            </div>
+            <div className="rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 space-y-1.5">
+              <p className="text-sm font-black text-primary line-clamp-2">{deletingReport.title}</p>
+              <p className="text-xs font-bold text-on-surface-variant">观点方：{deletingReport.institution}</p>
+              <p className="text-xs font-bold text-on-surface-variant">日期：{deletingReport.date}</p>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setDeletingReport(null)}
+                className="px-4 py-2 rounded-xl bg-surface-container-low text-primary text-sm font-black hover:bg-surface-container"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingReport}
+                onClick={() => void confirmDeleteReport()}
+                className="px-4 py-2 rounded-xl bg-tertiary-container text-surface text-sm font-black disabled:opacity-60"
+              >
+                {isDeletingReport ? '删除中...' : '确认删除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isReportDialogOpen && (
         <div className="fixed inset-0 z-50 bg-primary/30 backdrop-blur-sm flex items-center justify-center p-4">
           <form
@@ -911,17 +1301,30 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
               </button>
             </div>
 
+            {!isEditOpen && reportFormError && (
+              <div className="rounded-xl border border-error-container/50 bg-error-container/20 px-4 py-3 text-sm font-black text-error">
+                {reportFormError}
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {!isEditOpen && (
                 <label className="space-y-2">
                   <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">观点方</span>
-                  <input
-                    type="text"
+                  <select
                     value={form.institution}
-                    onChange={(event) => setForm((state) => ({ ...state, institution: event.target.value }))}
-                    placeholder="中信证券"
-                    className="w-full rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 text-sm font-bold outline-none focus:border-primary"
-                  />
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setForm((state) => ({ ...state, institution: value }));
+                      if (value.trim()) setReportFormError(null);
+                    }}
+                    className="w-full rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 text-sm font-bold text-primary outline-none focus:border-primary"
+                  >
+                    <option value="">请选择观点方</option>
+                    {institutions.map((institution) => (
+                      <option key={institution} value={institution}>{institution}</option>
+                    ))}
+                  </select>
                 </label>
               )}
               <label className="space-y-2">
@@ -957,51 +1360,49 @@ export const Reports: React.FC<ReportsProps> = ({ stockFilter, onClearStockFilte
               </label>
             </div>
 
-            {!isEditOpen && (
-              <div className="space-y-3">
-                <label className="space-y-2 block">
-                  <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">相关股票</span>
-                  <div className="relative">
-                    <div className="rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 flex items-center gap-3">
-                      <Search size={18} className="text-on-surface-variant shrink-0" />
-                      <input
-                        type="text"
-                        value={stockInput}
-                        onChange={(event) => setStockInput(event.target.value)}
-                        placeholder="输入代码或名称"
-                        className="bg-transparent border-none outline-none text-sm font-bold w-full"
-                      />
-                    </div>
-                    {(isSearchingStocks || stockSearchResults.length > 0) && (
-                      <div className="absolute z-10 mt-2 w-full rounded-2xl border border-outline-variant/20 bg-surface-container-lowest shadow-xl overflow-hidden">
-                        {isSearchingStocks && <div className="px-4 py-3 text-xs font-bold text-on-surface-variant">搜索中...</div>}
-                        {!isSearchingStocks && stockSearchResults.map((item) => (
-                          <button
-                            type="button"
-                            key={item.id}
-                            onClick={() => addStock(item)}
-                            className="w-full px-4 py-3 text-left hover:bg-surface-container-low transition-colors"
-                          >
-                            <span className="block text-sm font-black text-primary">{item.title}</span>
-                            <span className="block text-xs font-mono text-on-surface-variant">{item.id} · {item.subtitle}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
+            <div className="space-y-3">
+              <label className="space-y-2 block">
+                <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">相关股票</span>
+                <div className="relative">
+                  <div className="rounded-xl bg-surface-container-low border border-outline-variant/20 px-4 py-3 flex items-center gap-3">
+                    <Search size={18} className="text-on-surface-variant shrink-0" />
+                    <input
+                      type="text"
+                      value={stockInput}
+                      onChange={(event) => setStockInput(event.target.value)}
+                      placeholder="输入代码或名称"
+                      className="bg-transparent border-none outline-none text-sm font-bold w-full"
+                    />
                   </div>
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  {selectedStocks.map((stock) => (
-                    <span key={stock.symbol} className="inline-flex items-center gap-2 rounded-xl bg-primary text-surface px-3 py-2 text-xs font-black">
-                      {stock.name || stock.symbol}
-                      <button type="button" aria-label={`移除 ${stock.symbol}`} onClick={() => removeStock(stock.symbol)} className="text-surface/80 hover:text-surface">
-                        <X size={14} />
-                      </button>
-                    </span>
-                  ))}
+                  {(isSearchingStocks || stockSearchResults.length > 0) && (
+                    <div className="absolute z-10 mt-2 w-full rounded-2xl border border-outline-variant/20 bg-surface-container-lowest shadow-xl overflow-hidden">
+                      {isSearchingStocks && <div className="px-4 py-3 text-xs font-bold text-on-surface-variant">搜索中...</div>}
+                      {!isSearchingStocks && stockSearchResults.map((item) => (
+                        <button
+                          type="button"
+                          key={item.id}
+                          onClick={() => addStock(item)}
+                          className="w-full px-4 py-3 text-left hover:bg-surface-container-low transition-colors"
+                        >
+                          <span className="block text-sm font-black text-primary">{item.title}</span>
+                          <span className="block text-xs font-mono text-on-surface-variant">{item.id} · {item.subtitle}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
+              </label>
+              <div className="flex flex-wrap gap-2">
+                {selectedStocks.map((stock) => (
+                  <span key={stock.symbol} className="inline-flex items-center gap-2 rounded-xl bg-primary text-surface px-3 py-2 text-xs font-black">
+                    {stock.name || stock.symbol}
+                    <button type="button" aria-label={`移除 ${stock.symbol}`} onClick={() => removeStock(stock.symbol)} className="text-surface/80 hover:text-surface">
+                      <X size={14} />
+                    </button>
+                  </span>
+                ))}
               </div>
-            )}
+            </div>
 
             <label className="space-y-2 block">
               <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">正文</span>

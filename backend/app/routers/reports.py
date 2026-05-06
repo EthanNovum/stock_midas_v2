@@ -6,7 +6,14 @@ from fastapi.responses import Response
 
 from app.dependencies import get_conn
 from app.repositories import reports
-from app.schemas import ReportCreate, ReportStockVerdictUpdate, ReportUpdate
+from app.schemas import (
+    InstitutionCreatePayload,
+    InstitutionDeletePayload,
+    InstitutionRenamePayload,
+    ReportCreate,
+    ReportStockVerdictUpdate,
+    ReportUpdate,
+)
 
 router = APIRouter(prefix="/reports")
 
@@ -60,6 +67,44 @@ def update_report(report_id: str, payload: ReportUpdate, conn: sqlite3.Connectio
         report = reports.update_report(conn, report_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return report
+
+
+@router.post("/institutions", status_code=status.HTTP_201_CREATED)
+def create_institution(payload: InstitutionCreatePayload, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return reports.create_institution(conn, payload.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/institutions/name")
+def rename_institution(payload: InstitutionRenamePayload, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        ranking = reports.rename_institution(conn, payload.institution, payload.new_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ranking:
+        raise HTTPException(status_code=404, detail="Institution not found")
+    return ranking
+
+
+@router.delete("/institutions")
+def delete_institution(payload: InstitutionDeletePayload, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        ranking = reports.delete_institution(conn, payload.institution)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ranking:
+        raise HTTPException(status_code=404, detail="Institution not found")
+    return ranking
+
+
+@router.delete("/{report_id}")
+def delete_report(report_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    report = reports.delete_report(conn, report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     return report

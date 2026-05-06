@@ -1,9 +1,12 @@
 import hashlib
+import json
 import sqlite3
 
 
 DEFAULT_WATCHLIST_ID = "sector-my-watchlist"
 DEFAULT_WATCHLIST_NAME = "自选分组"
+REPORT_WATCHLIST_ID = "sector-report-watchlist"
+REPORT_WATCHLIST_NAME = "研报"
 VALID_CHART_RANGES = {"intraday", "5d", "daily", "weekly"}
 
 
@@ -13,6 +16,7 @@ class WatchlistError(ValueError):
 
 def list_watchlists(conn: sqlite3.Connection, group_by: str) -> dict:
     ensure_default_watchlist(conn)
+    ensure_report_watchlist(conn)
     if group_by == "flat":
         rows = stock_rows(conn, None)
         return {"groups": [{"id": "flat", "name": "全部自选", "stocks": rows}]}
@@ -21,9 +25,13 @@ def list_watchlists(conn: sqlite3.Connection, group_by: str) -> dict:
         """
         SELECT id, name, group_type
         FROM watchlists
-        ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, created_at
+        ORDER BY CASE
+            WHEN id=? THEN 0
+            WHEN id=? THEN 1
+            ELSE 2
+        END, created_at
         """,
-        (DEFAULT_WATCHLIST_ID,),
+        (DEFAULT_WATCHLIST_ID, REPORT_WATCHLIST_ID),
     ).fetchall()
     return {
         "groups": [
@@ -51,6 +59,11 @@ def stock_rows(conn: sqlite3.Connection, watchlist_id: str | None) -> list[dict]
             SELECT symbol, GROUP_CONCAT(DISTINCT watchlist_id) AS group_ids
             FROM watchlist_items
             GROUP BY symbol
+        ),
+        default_tags AS (
+            SELECT symbol, note
+            FROM watchlist_items
+            WHERE watchlist_id=?
         )
         SELECT
             substr(f.symbol, 1, instr(f.symbol, '.') - 1) AS id,
@@ -60,10 +73,12 @@ def stock_rows(conn: sqlite3.Connection, watchlist_id: str | None) -> list[dict]
             p.close AS price,
             printf('%.1fM', COALESCE(p.volume, 0) / 1000000.0) AS vol,
             COALESCE(p.pct_change, 0) AS pct,
-            memberships.group_ids
+            memberships.group_ids,
+            default_tags.note AS note
         FROM watchlist_items wi
         JOIN stock_fundamentals f ON f.symbol = wi.symbol
         LEFT JOIN memberships ON memberships.symbol = f.symbol
+        LEFT JOIN default_tags ON default_tags.symbol = f.symbol
         LEFT JOIN latest ON latest.symbol = f.symbol
         LEFT JOIN stock_daily_prices p
             ON p.symbol = latest.symbol
@@ -72,13 +87,14 @@ def stock_rows(conn: sqlite3.Connection, watchlist_id: str | None) -> list[dict]
         GROUP BY f.symbol
         ORDER BY f.market_cap DESC
         """,
-        (watchlist_id, watchlist_id),
+        (DEFAULT_WATCHLIST_ID, watchlist_id, watchlist_id),
     ).fetchall()
     return [
         {
             **{key: row[key] for key in row.keys() if key != "group_ids"},
             "industry": row["sector"],
             "groupIds": row["group_ids"].split(",") if row["group_ids"] else [],
+            "tags": parse_tags(row["note"]),
             "trend": stock_trend(conn, row["symbol"]),
         }
         for row in rows
@@ -136,9 +152,10 @@ def delete_watchlist(conn: sqlite3.Connection, watchlist_id: str) -> None:
 def add_stock(conn: sqlite3.Connection, watchlist_id: str, payload) -> dict:
     get_watchlist(conn, watchlist_id)
     symbol = normalize_symbol(payload.symbol)
+    note = normalize_note(payload.note)
     conn.execute(
         "INSERT OR IGNORE INTO watchlist_items (watchlist_id, symbol, note, created_at) VALUES (?, ?, ?, datetime('now'))",
-        (watchlist_id, symbol, payload.note),
+        (watchlist_id, symbol, note),
     )
     conn.commit()
     row = conn.execute(
@@ -150,6 +167,7 @@ def add_stock(conn: sqlite3.Connection, watchlist_id: str, payload) -> dict:
 
 def add_stock_to_default(conn: sqlite3.Connection, payload) -> dict:
     ensure_default_watchlist(conn)
+    ensure_report_watchlist(conn)
     return add_stock(conn, DEFAULT_WATCHLIST_ID, payload)
 
 
@@ -160,6 +178,25 @@ def delete_stock(conn: sqlite3.Connection, watchlist_id: str, symbol: str) -> No
         (watchlist_id, normalize_symbol(symbol)),
     )
     conn.commit()
+
+
+def update_stock_tags(conn: sqlite3.Connection, symbol: str, tags: list[str]) -> dict:
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_tags = normalize_tags(tags)
+    row = conn.execute(
+        "SELECT 1 FROM watchlist_items WHERE watchlist_id=? AND symbol=?",
+        (DEFAULT_WATCHLIST_ID, normalized_symbol),
+    ).fetchone()
+    if not row:
+        raise WatchlistError("股票不在默认自选分组")
+
+    tags_payload = json.dumps(normalized_tags, ensure_ascii=False) if normalized_tags else None
+    conn.execute(
+        "UPDATE watchlist_items SET note=? WHERE watchlist_id=? AND symbol=?",
+        (tags_payload, DEFAULT_WATCHLIST_ID, normalized_symbol),
+    )
+    conn.commit()
+    return {"symbol": normalized_symbol, "tags": normalized_tags}
 
 
 def ensure_default_watchlist(conn: sqlite3.Connection) -> None:
@@ -177,6 +214,17 @@ def ensure_default_watchlist(conn: sqlite3.Connection) -> None:
         WHERE id=? AND name='我的自选'
         """,
         (DEFAULT_WATCHLIST_NAME, DEFAULT_WATCHLIST_ID),
+    )
+    conn.commit()
+
+
+def ensure_report_watchlist(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO watchlists (id, name, group_type, created_at)
+        VALUES (?, ?, 'sector', datetime('now'))
+        """,
+        (REPORT_WATCHLIST_ID, REPORT_WATCHLIST_NAME),
     )
     conn.commit()
 
@@ -276,6 +324,55 @@ def normalize_name(name: str) -> str:
     return stripped
 
 
+def parse_tags(note: str | None) -> list[str]:
+    if not note:
+        return []
+
+    try:
+        parsed = json.loads(note)
+    except json.JSONDecodeError:
+        legacy = note.strip()
+        return [legacy] if legacy else []
+
+    if not isinstance(parsed, list):
+        return []
+
+    tags: list[str] = []
+    for raw in parsed:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if text and text not in tags:
+            tags.append(text)
+    return tags
+
+
+def normalize_tags(tags: list[str]) -> list[str]:
+    unique_tags: list[str] = []
+    for raw in tags:
+        text = str(raw).strip()
+        if not text:
+            continue
+        if len(text) > 20:
+            raise WatchlistError("单个标签不能超过20个字符")
+        if text not in unique_tags:
+            unique_tags.append(text)
+    if len(unique_tags) > 10:
+        raise WatchlistError("标签最多10个")
+    return unique_tags
+
+
+def normalize_note(note: str | None) -> str | None:
+    if note is None:
+        return None
+    stripped = note.strip()
+    if not stripped:
+        return None
+    if len(stripped) > 20:
+        raise WatchlistError("备注不能超过20个字符")
+    return stripped
+
+
 def normalize_symbol(symbol: str) -> str:
     stripped = symbol.strip().upper()
     if not stripped:
@@ -297,6 +394,18 @@ def unique_watchlist_id(conn: sqlite3.Connection, group_type: str, name: str) ->
         candidate = f"{base}-{suffix}"
         suffix += 1
     return candidate
+
+
+def add_stock_to_report_watchlist(conn: sqlite3.Connection, symbol: str, note: str | None = None) -> None:
+    ensure_report_watchlist(conn)
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_note = normalize_note(note)
+    conn.execute(
+        "INSERT OR IGNORE INTO watchlist_items (watchlist_id, symbol, note, created_at) VALUES (?, ?, ?, datetime('now'))",
+        (REPORT_WATCHLIST_ID, normalized_symbol, normalized_note),
+    )
+    conn.commit()
+
 
 
 def slugify(value: str) -> str:

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.dependencies import get_conn
 from app.repositories import watchlists
-from app.schemas import WatchlistCreate, WatchlistStockCreate, WatchlistUpdate
+from app.schemas import WatchlistCreate, WatchlistStockCreate, WatchlistStockTagsUpdate, WatchlistUpdate
 
 router = APIRouter(prefix="/watchlists")
 
@@ -62,6 +62,15 @@ def delete_stock(watchlist_id: str, symbol: str, conn: sqlite3.Connection = Depe
     except watchlists.WatchlistError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/stocks/{symbol}/tags")
+def update_stock_tags(symbol: str, payload: WatchlistStockTagsUpdate, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return watchlists.update_stock_tags(conn, symbol, payload.tags)
+    except watchlists.WatchlistError as exc:
+        status_code = 404 if str(exc) == "股票不在默认自选分组" else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.get("/stocks/{symbol}/chart")

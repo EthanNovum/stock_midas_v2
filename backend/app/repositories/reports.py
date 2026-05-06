@@ -2,12 +2,24 @@ import base64
 import binascii
 import sqlite3
 
+from app.repositories import watchlists
+
 
 RATING_LABELS = {
     "buy": "买入",
     "hold": "维持",
     "sell": "卖出",
 }
+
+
+def normalize_institution_name(name: str | None) -> str:
+    return (name or "").strip()
+
+
+def institution_exists(conn: sqlite3.Connection, name: str) -> bool:
+    if conn.execute("SELECT 1 FROM report_institutions WHERE name=?", (name,)).fetchone():
+        return True
+    return conn.execute("SELECT 1 FROM research_reports WHERE institution=? LIMIT 1", (name,)).fetchone() is not None
 
 
 def list_reports(
@@ -80,10 +92,14 @@ def list_reports(
     ).fetchall()
     items = [dict(row) for row in rows]
     add_report_stocks(conn, items)
-    institutions = [
+    report_institutions = {
         row["institution"]
-        for row in conn.execute("SELECT DISTINCT institution FROM research_reports ORDER BY institution").fetchall()
-    ]
+        for row in conn.execute("SELECT DISTINCT institution FROM research_reports WHERE institution != ''").fetchall()
+    }
+    managed_institutions = {
+        row["name"] for row in conn.execute("SELECT name FROM report_institutions WHERE name != ''").fetchall()
+    }
+    institutions = sorted(report_institutions | managed_institutions)
     return {
         "items": items,
         "page": page,
@@ -127,6 +143,154 @@ def institution_rankings(conn: sqlite3.Connection) -> list[dict]:
             }
         )
     return rankings
+
+
+def get_institution_ranking(conn: sqlite3.Connection, institution: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT
+            research_reports.institution,
+            COUNT(DISTINCT research_reports.id) AS reportCount,
+            COUNT(COALESCE(rs.symbol, research_reports.ticker)) AS stockMentions,
+            SUM(CASE WHEN COALESCE(rs.verdict, 'flat') = 'win' THEN 1 ELSE 0 END) AS wins
+        FROM research_reports
+        LEFT JOIN report_stocks rs ON rs.report_id = research_reports.id
+        WHERE research_reports.institution=?
+        GROUP BY research_reports.institution
+        HAVING reportCount > 0
+        """,
+        (institution,),
+    ).fetchone()
+    if not row:
+        return None
+
+    stock_mentions = row["stockMentions"] or 0
+    wins = row["wins"] or 0
+    return {
+        "institution": row["institution"],
+        "reportCount": row["reportCount"],
+        "stockMentions": stock_mentions,
+        "wins": wins,
+        "winRate": round((wins / stock_mentions) * 100, 2) if stock_mentions else 0,
+    }
+
+
+def create_institution(conn: sqlite3.Connection, name: str) -> dict:
+    institution_name = normalize_institution_name(name)
+    if not institution_name:
+        raise ValueError("机构名称不能为空")
+    if institution_exists(conn, institution_name):
+        raise ValueError("机构已存在")
+
+    conn.execute(
+        "INSERT INTO report_institutions (name, created_at) VALUES (?, datetime('now'))",
+        (institution_name,),
+    )
+    conn.commit()
+    return {"name": institution_name}
+
+
+def rename_institution(conn: sqlite3.Connection, institution: str, new_name: str) -> dict | None:
+    source_name = normalize_institution_name(institution)
+    target_name = normalize_institution_name(new_name)
+    if not source_name:
+        raise ValueError("机构名称不能为空")
+    if not target_name:
+        raise ValueError("新机构名称不能为空")
+
+    report_exists = conn.execute(
+        "SELECT 1 FROM research_reports WHERE institution=? LIMIT 1",
+        (source_name,),
+    ).fetchone() is not None
+    managed_exists = conn.execute(
+        "SELECT 1 FROM report_institutions WHERE name=?",
+        (source_name,),
+    ).fetchone() is not None
+    if not report_exists and not managed_exists:
+        return None
+
+    if source_name != target_name and institution_exists(conn, target_name):
+        raise ValueError("新机构名称已存在")
+
+    conn.execute(
+        """
+        UPDATE research_reports
+        SET institution=?
+        WHERE institution=?
+        """,
+        (target_name, source_name),
+    )
+    if managed_exists:
+        conn.execute("DELETE FROM report_institutions WHERE name=?", (source_name,))
+    if not conn.execute("SELECT 1 FROM research_reports WHERE institution=? LIMIT 1", (target_name,)).fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO report_institutions (name, created_at) VALUES (?, datetime('now'))",
+            (target_name,),
+        )
+
+    conn.commit()
+    return get_institution_ranking(conn, target_name) or {
+        "institution": target_name,
+        "reportCount": 0,
+        "stockMentions": 0,
+        "wins": 0,
+        "winRate": 0,
+    }
+
+
+def delete_institution(conn: sqlite3.Connection, institution: str) -> dict | None:
+    source_name = normalize_institution_name(institution)
+    if not source_name:
+        raise ValueError("机构名称不能为空")
+
+    ranking = get_institution_ranking(conn, source_name)
+    managed_exists = conn.execute(
+        "SELECT 1 FROM report_institutions WHERE name=?",
+        (source_name,),
+    ).fetchone() is not None
+    if not ranking and not managed_exists:
+        return None
+
+    report_ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM research_reports WHERE institution=?",
+            (source_name,),
+        ).fetchall()
+    ]
+    if report_ids:
+        placeholders = ",".join("?" for _ in report_ids)
+        conn.execute(f"DELETE FROM report_stocks WHERE report_id IN ({placeholders})", report_ids)
+        conn.execute(f"DELETE FROM report_klines WHERE report_id IN ({placeholders})", report_ids)
+    conn.execute("DELETE FROM research_reports WHERE institution=?", (source_name,))
+    conn.execute("DELETE FROM report_institutions WHERE name=?", (source_name,))
+    conn.commit()
+    return ranking or {
+        "institution": source_name,
+        "reportCount": 0,
+        "stockMentions": 0,
+        "wins": 0,
+        "winRate": 0,
+    }
+
+
+def delete_report(conn: sqlite3.Connection, report_id: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT id, title, institution
+        FROM research_reports
+        WHERE id=?
+        """,
+        (report_id,),
+    ).fetchone()
+    if not row:
+        return None
+
+    conn.execute("DELETE FROM report_stocks WHERE report_id=?", (report_id,))
+    conn.execute("DELETE FROM report_klines WHERE report_id=?", (report_id,))
+    conn.execute("DELETE FROM research_reports WHERE id=?", (report_id,))
+    conn.commit()
+    return {"id": row["id"], "title": row["title"], "institution": row["institution"]}
 
 
 def get_report(conn: sqlite3.Connection, report_id: str) -> dict | None:
@@ -174,10 +338,14 @@ def create_report(conn: sqlite3.Connection, payload) -> dict:
     if not stocks:
         raise ValueError("请至少选择一只相关股票")
 
+    institution_name = normalize_institution_name(payload.institution)
+    if not institution_name:
+        raise ValueError("请填写观点方")
+
     row = conn.execute("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 AS id FROM research_reports").fetchone()
     report_id = str(row["id"])
     primary_stock = stocks[0]
-    title = payload.title or default_title(primary_stock, payload.institution, payload.rating.value, payload.date.isoformat())
+    title = payload.title or default_title(primary_stock, institution_name, payload.rating.value, payload.date.isoformat())
     file_data = decode_file_content(payload.source_file_content)
 
     conn.execute(
@@ -195,7 +363,7 @@ def create_report(conn: sqlite3.Connection, payload) -> dict:
             primary_stock["symbol"],
             primary_stock["name"] or primary_stock["symbol"],
             payload.rating.value,
-            payload.institution,
+            institution_name,
             payload.date.isoformat(),
             payload.content,
             payload.source_url,
@@ -211,6 +379,8 @@ def create_report(conn: sqlite3.Connection, payload) -> dict:
         """,
         [(report_id, stock["symbol"], stock["name"]) for stock in stocks],
     )
+    for stock in stocks:
+        watchlists.add_stock_to_report_watchlist(conn, stock["symbol"])
     conn.commit()
     return {"id": report_id}
 
@@ -223,22 +393,41 @@ def update_report(conn: sqlite3.Connection, report_id: str, payload) -> dict | N
     if not content:
         raise ValueError("请填写研报正文")
 
-    cursor = conn.execute(
+    stocks = normalize_payload_stocks(conn, payload)
+    if not stocks:
+        raise ValueError("请至少选择一只相关股票")
+
+    existing = conn.execute("SELECT id FROM research_reports WHERE id=?", (report_id,)).fetchone()
+    if not existing:
+        return None
+
+    primary_stock = stocks[0]
+    conn.execute(
         """
         UPDATE research_reports
-        SET title=?, rating=?, report_date=?, content=?
+        SET title=?, ticker=?, ticker_name=?, rating=?, report_date=?, content=?
         WHERE id=?
         """,
         (
             title,
+            primary_stock["symbol"],
+            primary_stock["name"] or primary_stock["symbol"],
             payload.rating.value,
             payload.date.isoformat(),
             content,
             report_id,
         ),
     )
-    if cursor.rowcount == 0:
-        return None
+    conn.execute("DELETE FROM report_stocks WHERE report_id=?", (report_id,))
+    conn.executemany(
+        """
+        INSERT INTO report_stocks (report_id, symbol, name, verdict)
+        VALUES (?, ?, ?, 'flat')
+        """,
+        [(report_id, stock["symbol"], stock["name"]) for stock in stocks],
+    )
+    for stock in stocks:
+        watchlists.add_stock_to_report_watchlist(conn, stock["symbol"])
     conn.commit()
     return get_report(conn, report_id)
 

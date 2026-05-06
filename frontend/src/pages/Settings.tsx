@@ -21,6 +21,7 @@ interface DataSyncJob {
   jobId: string;
   status: Exclude<DataSyncStatus, 'idle'>;
   limit?: number;
+  symbols?: string[];
   updateMode?: DataSyncUpdateMode;
   startDate?: string | null;
   endDate?: string | null;
@@ -104,6 +105,7 @@ export const Settings: React.FC = () => {
   const [syncIsRealtime, setSyncIsRealtime] = useState(false);
   const [syncBackend, setSyncBackend] = useState<'redis' | 'sqlite-fallback'>('sqlite-fallback');
   const [pollIntervalMs, setPollIntervalMs] = useState(3000);
+  const [singleStockRefreshSymbol, setSingleStockRefreshSymbol] = useState('');
 
   const themes = [
     { id: 'light', label: '浅色模式', icon: Sun },
@@ -139,6 +141,7 @@ export const Settings: React.FC = () => {
     setSyncIsRealtime(Boolean(job.isRealtime));
     setSyncBackend(job.backend ?? 'sqlite-fallback');
     setPollIntervalMs(job.pollIntervalMs && job.pollIntervalMs > 0 ? job.pollIntervalMs : (job.status === 'running' ? 2000 : 3000));
+    setSingleStockRefreshSymbol(job.symbols?.length === 1 ? job.symbols[0] : '');
     if (job.limit) setSyncLimit(String(job.limit));
     if (job.updateMode) setSyncUpdateMode(job.updateMode);
     if (job.startDate) setSyncStartDate(job.startDate);
@@ -564,7 +567,7 @@ export const Settings: React.FC = () => {
                 <div>
                   <p>{syncMessage}</p>
                   <p className="text-[10px] font-black uppercase tracking-widest mt-2 opacity-70">
-                    范围: {syncUpdateMode === 'full' ? '基础信息 / 基本面 / 日线行情' : '日线行情'} · 日期 {syncStartDate || '不限'} 至 {syncEndDate || '不限'}
+                    范围: {singleStockRefreshSymbol ? `个股 ${singleStockRefreshSymbol} 日报` : (syncUpdateMode === 'full' ? '基础信息 / 基本面 / 日线行情' : '日线行情')} · 日期 {syncStartDate || '不限'} 至 {syncEndDate || '不限'}
                     {totalTasks > 0 && ` · 任务 ${completedTasks.toLocaleString()}/${totalTasks.toLocaleString()}`}
                     {failedRows > 0 && ` · 失败 ${failedRows.toLocaleString()} 条`}
                     {` · 状态源 ${syncIsRealtime ? '实时' : '历史'} · 后端 ${syncBackend === 'redis' ? 'Redis' : 'SQLite 回退'}`}

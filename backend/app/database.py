@@ -21,6 +21,8 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -172,6 +174,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(report_id, symbol)
         );
 
+        CREATE TABLE IF NOT EXISTS report_institutions (
+            name TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS report_klines (
             id INTEGER PRIMARY KEY,
             report_id TEXT NOT NULL,
@@ -220,6 +227,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
             read INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_stock_daily_prices_symbol_date
+            ON stock_daily_prices(symbol, trade_date);
+        CREATE INDEX IF NOT EXISTS idx_stock_daily_prices_date_symbol
+            ON stock_daily_prices(trade_date, symbol);
+        CREATE INDEX IF NOT EXISTS idx_stock_fundamentals_market_cap_symbol
+            ON stock_fundamentals(market_cap DESC, symbol ASC);
         """
     )
     ensure_column(conn, "data_sync_jobs", "limit_value", "INTEGER NOT NULL DEFAULT 300")
@@ -239,6 +253,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "report_stocks", "verdict", "TEXT NOT NULL DEFAULT 'flat'")
     conn.execute("DROP TABLE IF EXISTS llm_models")
     backfill_report_stocks(conn)
+    backfill_report_watchlist(conn)
     conn.execute("UPDATE stock_fundamentals SET ownership = '民营企业' WHERE ownership = '民企'")
 
 
@@ -255,6 +270,23 @@ def backfill_report_stocks(conn: sqlite3.Connection) -> None:
         SELECT id, ticker, ticker_name
         FROM research_reports
         WHERE ticker IS NOT NULL AND ticker != ''
+        """
+    )
+
+
+def backfill_report_watchlist(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO watchlists (id, name, group_type, created_at)
+        VALUES ('sector-report-watchlist', '研报', 'sector', datetime('now'))
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO watchlist_items (watchlist_id, symbol, note, created_at)
+        SELECT 'sector-report-watchlist', rs.symbol, NULL, datetime('now')
+        FROM report_stocks rs
+        WHERE rs.symbol IS NOT NULL AND rs.symbol != ''
         """
     )
 
@@ -326,11 +358,72 @@ def clean_demo_dashboard_data(conn: sqlite3.Connection) -> None:
 
 def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: str | None = None) -> int:
     timestamp = timestamp or now_iso()
+
+    fundamentals_params: list[tuple] = []
+    latest_price_params: list[tuple] = []
+    historical_price_params: list[tuple] = []
+
     updated = 0
     for row in rows:
         normalized = normalize_stock_row(row)
         ma_fields = calculate_ma120_fields(normalized["close"], normalized["ma120"])
-        conn.execute(
+        fundamentals_params.append(
+            (
+                normalized["symbol"],
+                normalized["name"],
+                normalized["market"],
+                normalized["exchange"],
+                normalized["listing_exchange"],
+                normalized["ownership"],
+                normalized["sector"],
+                normalized["market_cap"],
+                normalized["pe_ttm"],
+                normalized["dividend_yield"],
+                normalized["pb"],
+                normalized["roe"],
+                ma_fields["ma120"],
+                ma_fields["ma120_lower"],
+                ma_fields["ma120_upper"],
+                ma_fields["signal"],
+                normalized["revenue_segments_json"],
+                timestamp,
+            )
+        )
+        latest_price_params.append(
+            (
+                normalized["symbol"],
+                normalized["trade_date"],
+                normalized["open"],
+                normalized["close"],
+                normalized["high"],
+                normalized["low"],
+                normalized["volume"],
+                normalized["amount"],
+                normalized["pct_change"],
+                normalized["pct_change"],
+                timestamp,
+            )
+        )
+        for price_row in normalized.get("daily_prices", []):
+            historical_price_params.append(
+                (
+                    normalized["symbol"],
+                    price_row["trade_date"],
+                    price_row["open"],
+                    price_row["close"],
+                    price_row["high"],
+                    price_row["low"],
+                    price_row["volume"],
+                    price_row["amount"],
+                    price_row["pct_change"],
+                    price_row["pct_change"],
+                    timestamp,
+                )
+            )
+        updated += 2
+
+    if fundamentals_params:
+        conn.executemany(
             """
             INSERT INTO stock_fundamentals (
                 symbol, name, market, exchange, listing_exchange, ownership, sector, market_cap,
@@ -357,93 +450,32 @@ def upsert_stocks(conn: sqlite3.Connection, rows: Iterable[tuple], timestamp: st
                 revenue_segments_json=excluded.revenue_segments_json,
                 updated_at=excluded.updated_at
             """,
-            (
-                normalized["symbol"],
-                normalized["name"],
-                normalized["market"],
-                normalized["exchange"],
-                normalized["listing_exchange"],
-                normalized["ownership"],
-                normalized["sector"],
-                normalized["market_cap"],
-                normalized["pe_ttm"],
-                normalized["dividend_yield"],
-                normalized["pb"],
-                normalized["roe"],
-                ma_fields["ma120"],
-                ma_fields["ma120_lower"],
-                ma_fields["ma120_upper"],
-                ma_fields["signal"],
-                normalized["revenue_segments_json"],
-                timestamp,
-            ),
+            fundamentals_params,
         )
-        conn.execute(
-            """
-            INSERT INTO stock_daily_prices (
-                symbol, trade_date, open, close, high, low, volume, amount,
-                change, pct_change, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(symbol, trade_date) DO UPDATE SET
-                open=excluded.open,
-                close=excluded.close,
-                high=excluded.high,
-                low=excluded.low,
-                volume=excluded.volume,
-                amount=excluded.amount,
-                change=excluded.change,
-                pct_change=excluded.pct_change,
-                updated_at=excluded.updated_at
-            """,
-            (
-                normalized["symbol"],
-                normalized["trade_date"],
-                normalized["open"],
-                normalized["close"],
-                normalized["high"],
-                normalized["low"],
-                normalized["volume"],
-                normalized["amount"],
-                normalized["pct_change"],
-                normalized["pct_change"],
-                timestamp,
-            ),
+
+    price_upsert_sql = """
+        INSERT INTO stock_daily_prices (
+            symbol, trade_date, open, close, high, low, volume, amount,
+            change, pct_change, updated_at
         )
-        for price_row in normalized.get("daily_prices", []):
-            conn.execute(
-                """
-                INSERT INTO stock_daily_prices (
-                    symbol, trade_date, open, close, high, low, volume, amount,
-                    change, pct_change, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, trade_date) DO UPDATE SET
-                    open=excluded.open,
-                    close=excluded.close,
-                    high=excluded.high,
-                    low=excluded.low,
-                    volume=excluded.volume,
-                    amount=excluded.amount,
-                    change=excluded.change,
-                    pct_change=excluded.pct_change,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    normalized["symbol"],
-                    price_row["trade_date"],
-                    price_row["open"],
-                    price_row["close"],
-                    price_row["high"],
-                    price_row["low"],
-                    price_row["volume"],
-                    price_row["amount"],
-                    price_row["pct_change"],
-                    price_row["pct_change"],
-                    timestamp,
-                ),
-            )
-        updated += 2
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(symbol, trade_date) DO UPDATE SET
+            open=excluded.open,
+            close=excluded.close,
+            high=excluded.high,
+            low=excluded.low,
+            volume=excluded.volume,
+            amount=excluded.amount,
+            change=excluded.change,
+            pct_change=excluded.pct_change,
+            updated_at=excluded.updated_at
+    """
+
+    if latest_price_params:
+        conn.executemany(price_upsert_sql, latest_price_params)
+    if historical_price_params:
+        conn.executemany(price_upsert_sql, historical_price_params)
+
     return updated
 
 

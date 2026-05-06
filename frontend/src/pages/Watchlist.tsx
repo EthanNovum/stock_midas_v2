@@ -30,6 +30,7 @@ interface StockItem {
   price?: number | null;
   vol?: string;
   pct?: number;
+  tags?: string[];
   groupIds?: string[];
 }
 
@@ -108,9 +109,10 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
   const [selectedGroupId, setSelectedGroupId] = useState(DEFAULT_WATCHLIST_ID);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<StockSearchResult[]>([]);
-  const [selectedSearchResult, setSelectedSearchResult] = useState<StockSearchResult | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
-  const [selectedAddGroupIds, setSelectedAddGroupIds] = useState<string[]>([]);
+  const [editingTagSymbol, setEditingTagSymbol] = useState<string | null>(null);
+  const [editingTags, setEditingTags] = useState<string[]>([]);
+  const [newTagInput, setNewTagInput] = useState('');
   const [newGroupName, setNewGroupName] = useState('');
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingGroupName, setEditingGroupName] = useState('');
@@ -285,13 +287,16 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
     }
   };
 
-  const searchStocks = async () => {
-    const query = normalizeSearchInput(searchQuery);
-    if (!query) return;
+  const searchStocks = async (queryText: string) => {
+    const query = normalizeSearchInput(queryText);
+    if (!query) {
+      setSearchResults([]);
+      setHasSearched(false);
+      return;
+    }
 
     setIsSearching(true);
     setHasSearched(true);
-    setSelectedSearchResult(null);
     setErrorMessage(null);
 
     try {
@@ -300,9 +305,6 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
       const payload = await response.json() as { items?: StockSearchResult[] };
       const stocks = (payload.items ?? []).filter((item) => item.type === 'stock');
       setSearchResults(stocks);
-      if (stocks.length === 1) {
-        setSelectedSearchResult(stocks[0]);
-      }
     } catch (error) {
       setSearchResults([]);
       setErrorMessage(error instanceof Error ? error.message : '搜索股票失败');
@@ -311,37 +313,17 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
     }
   };
 
-  const addStock = async () => {
-    if (!selectedSearchResult) {
-      setErrorMessage('请先搜索并选择要添加的股票');
-      return;
-    }
-
+  const addSearchResultToWatchlist = async (result: StockSearchResult) => {
     setIsSaving(true);
     setErrorMessage(null);
 
-    const symbol = selectedSearchResult.id;
-    const targetGroupIds = Array.from(new Set([DEFAULT_WATCHLIST_ID, ...selectedAddGroupIds]));
     try {
-      const responses = await Promise.all(
-        targetGroupIds.map((groupId) => {
-          const url = groupId === DEFAULT_WATCHLIST_ID
-            ? '/api/v1/watchlists/stocks'
-            : `/api/v1/watchlists/${encodeURIComponent(groupId)}/stocks`;
-          return fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ symbol }),
-          });
-        })
-      );
-
-      const failedResponse = responses.find((response) => !response.ok);
-      if (failedResponse) throw new Error(`HTTP ${failedResponse.status}`);
-      setSearchQuery('');
-      setSearchResults([]);
-      setSelectedSearchResult(null);
-      setHasSearched(false);
+      const response = await fetch('/api/v1/watchlists/stocks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: result.id }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await loadGroups();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '添加股票失败，请确认已同步该股票行情');
@@ -396,11 +378,96 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
     await removeStockFromGroup(stock, activeGroup.id);
   };
 
-  const toggleAddGroup = (groupId: string) => {
-    setSelectedAddGroupIds((current) =>
-      current.includes(groupId) ? current.filter((id) => id !== groupId) : [...current, groupId]
-    );
+  const startEditTags = (stock: StockItem) => {
+    setEditingTagSymbol(stock.symbol);
+    setEditingTags(stock.tags ?? []);
+    setNewTagInput('');
   };
+
+  const cancelEditTags = () => {
+    setEditingTagSymbol(null);
+    setEditingTags([]);
+    setNewTagInput('');
+  };
+
+  const addTagDraft = () => {
+    const text = newTagInput.trim();
+    if (!text) return;
+    if (text.length > 20) {
+      setErrorMessage('单个标签不能超过20个字符');
+      return;
+    }
+    if (editingTags.includes(text)) {
+      setNewTagInput('');
+      return;
+    }
+    if (editingTags.length >= 10) {
+      setErrorMessage('标签最多10个');
+      return;
+    }
+    setEditingTags((current) => [...current, text]);
+    setNewTagInput('');
+  };
+
+  const removeTagDraft = (tag: string) => {
+    setEditingTags((current) => current.filter((item) => item !== tag));
+  };
+
+  const saveStockTags = async (stock: StockItem) => {
+    const pendingTag = newTagInput.trim();
+    let nextTags = editingTags;
+    if (pendingTag) {
+      if (pendingTag.length > 20) {
+        setErrorMessage('单个标签不能超过20个字符');
+        return;
+      }
+      if (!nextTags.includes(pendingTag)) {
+        nextTags = [...nextTags, pendingTag];
+      }
+    }
+    if (nextTags.length > 10) {
+      setErrorMessage('标签最多10个');
+      return;
+    }
+
+    setIsSaving(true);
+    setErrorMessage(null);
+    try {
+      const response = await fetch(`/api/v1/watchlists/stocks/${encodeURIComponent(stock.symbol)}/tags`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tags: nextTags }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null) as { detail?: string } | null;
+        throw new Error(payload?.detail || `HTTP ${response.status}`);
+      }
+      cancelEditTags();
+      await loadGroups();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '保存标签失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    const keyword = searchQuery.trim();
+    if (!keyword) {
+      setSearchResults([]);
+      setHasSearched(false);
+      setIsSearching(false);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void searchStocks(keyword);
+    }, 250);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [searchQuery]);
 
   return (
     <div className="max-w-7xl mx-auto space-y-8">
@@ -425,11 +492,7 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
                 value={searchQuery}
                 onChange={(event) => {
                   setSearchQuery(event.target.value);
-                  setSelectedSearchResult(null);
                   setHasSearched(false);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') searchStocks();
                 }}
                 placeholder="输入名称或代码，如 贵州茅台"
                 className="bg-transparent outline-none text-sm font-bold text-primary placeholder:text-on-surface-variant/60 w-56"
@@ -440,29 +503,27 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
               <div className="absolute right-0 top-12 z-30 w-full sm:w-[360px] rounded-xl border border-outline-variant/20 bg-surface-container-lowest shadow-xl overflow-hidden">
                 {searchResults.length > 0 ? (
                   searchResults.map((result) => (
-                    <button
+                    <div
                       key={result.id}
-                      type="button"
-                      onClick={() => {
-                        setSelectedSearchResult(result);
-                        setSearchQuery(`${result.title} ${result.id}`);
-                      }}
-                      className={cn(
-                        'w-full px-4 py-3 text-left transition-colors border-b border-outline-variant/10 last:border-b-0',
-                        selectedSearchResult?.id === result.id
-                          ? 'bg-primary text-white'
-                          : 'text-primary hover:bg-surface-container-low'
-                      )}
+                      className="flex items-center justify-between gap-2 border-b border-outline-variant/10 px-4 py-3 last:border-b-0"
                     >
-                      <span className="block text-sm font-black">{result.title}</span>
-                      <span className={cn(
-                        'mt-1 block text-xs font-bold',
-                        selectedSearchResult?.id === result.id ? 'text-white/80' : 'text-on-surface-variant'
-                      )}>
-                        {result.id} · {result.industry ?? result.subtitle ?? '未分类'}
-                        {typeof result.latestPrice === 'number' ? ` · ${formatPrice(result.latestPrice)}` : ''}
-                      </span>
-                    </button>
+                      <div className="min-w-0 text-left">
+                        <span className="block truncate text-sm font-black text-primary">{result.title}</span>
+                        <span className="mt-1 block truncate text-xs font-bold text-on-surface-variant">
+                          {result.id} · {result.industry ?? result.subtitle ?? '未分类'}
+                          {typeof result.latestPrice === 'number' ? ` · ${formatPrice(result.latestPrice)}` : ''}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void addSearchResultToWatchlist(result)}
+                        disabled={isSaving}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-black text-white disabled:opacity-50"
+                      >
+                        <Plus size={12} className="stroke-[3px]" />
+                        加入自选
+                      </button>
+                    </div>
                   ))
                 ) : (
                   <div className="px-4 py-3 text-sm font-bold text-on-surface-variant">
@@ -472,24 +533,6 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
               </div>
             )}
           </div>
-          <button
-            type="button"
-            onClick={searchStocks}
-            disabled={isSearching || !searchQuery.trim()}
-            className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-surface-container-high text-primary text-sm font-black disabled:opacity-50 transition-all"
-          >
-            <Search size={16} className={cn('stroke-[3px]', isSearching && 'animate-pulse')} />
-            搜索
-          </button>
-          <button
-            type="button"
-            onClick={addStock}
-            disabled={isSaving || !selectedSearchResult}
-            className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-primary text-white text-sm font-black disabled:opacity-50 transition-all"
-          >
-            <Plus size={16} className="stroke-[3px]" />
-            添加到自选
-          </button>
         </div>
       </div>
 
@@ -560,30 +603,6 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
         </div>
 
         <div className="flex flex-col lg:flex-row gap-3 lg:items-center justify-between">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-black text-on-surface-variant">加入分组</span>
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 text-primary px-3 py-1.5 text-xs font-black">
-              <Check size={13} />
-              {groupNameById[DEFAULT_WATCHLIST_ID] ?? '自选分组'}
-            </span>
-            {customGroups.map((group) => (
-              <button
-                key={group.id}
-                type="button"
-                onClick={() => toggleAddGroup(group.id)}
-                className={cn(
-                  'inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-black transition-all',
-                  selectedAddGroupIds.includes(group.id)
-                    ? 'bg-primary text-white border-primary'
-                    : 'bg-surface-container-lowest text-on-surface-variant border-outline-variant/20 hover:text-primary'
-                )}
-              >
-                {selectedAddGroupIds.includes(group.id) && <Check size={13} />}
-                {group.name}
-              </button>
-            ))}
-          </div>
-
           <div className="flex items-center gap-2">
             <input
               value={newGroupName}
@@ -678,16 +697,37 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
                       {stock.id}
                     </button>
                     <div className="min-w-0">
-                      <button
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          selectStock(stock);
-                        }}
-                        className="font-headline font-[800] text-xl text-primary hover:text-primary-container transition-colors text-left"
-                      >
-                        {stock.name}
-                      </button>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            selectStock(stock);
+                          }}
+                          className="font-headline font-[800] text-xl text-primary hover:text-primary-container transition-colors text-left"
+                        >
+                          {stock.name}
+                        </button>
+                        {(stock.tags ?? []).map((tag) => (
+                          <span
+                            key={`${stock.symbol}-tag-${tag}`}
+                            className="inline-flex items-center rounded-lg border border-primary/25 bg-primary/5 px-2 py-0.5 text-[10px] font-black text-primary"
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            startEditTags(stock);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-lg border border-outline-variant/20 bg-surface-container-low px-2 py-0.5 text-[10px] font-black text-on-surface-variant hover:text-primary"
+                        >
+                          <Pencil size={11} className="stroke-[3px]" />
+                          标签
+                        </button>
+                      </div>
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <span className="text-xs font-black text-on-surface-variant">{stock.symbol}</span>
                         <span className="text-xs font-bold text-on-surface-variant/70">{stock.industry ?? stock.sector ?? '未分类'}</span>
@@ -721,7 +761,75 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onOpenStockDetail }) => {
                   </div>
                 </div>
 
-                <div className="mt-4 flex flex-wrap gap-2">
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  {editingTagSymbol === stock.symbol && (
+                    <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-outline-variant/20 bg-surface-container-lowest px-2 py-1.5">
+                      {editingTags.map((tag) => (
+                        <span key={`${stock.symbol}-editing-${tag}`} className="inline-flex items-center gap-1 rounded-lg bg-primary/10 px-2 py-0.5 text-[10px] font-black text-primary">
+                          {tag}
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              removeTagDraft(tag);
+                            }}
+                            className="rounded-full p-0.5 hover:bg-primary/20"
+                            aria-label={`删除标签 ${tag}`}
+                          >
+                            <X size={10} className="stroke-[3px]" />
+                          </button>
+                        </span>
+                      ))}
+                      <input
+                        value={newTagInput}
+                        onChange={(event) => setNewTagInput(event.target.value.slice(0, 20))}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            addTagDraft();
+                          }
+                        }}
+                        maxLength={20}
+                        placeholder="输入标签"
+                        className="w-24 bg-transparent text-xs font-bold text-primary outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          addTagDraft();
+                        }}
+                        className="rounded-full p-0.5 text-primary hover:bg-surface-container-low"
+                        aria-label={`新增 ${stock.name} 标签`}
+                      >
+                        <Plus size={12} className="stroke-[3px]" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void saveStockTags(stock);
+                        }}
+                        disabled={isSaving}
+                        className="rounded-full p-0.5 text-primary hover:bg-surface-container-low disabled:opacity-50"
+                        aria-label={`保存 ${stock.name} 标签`}
+                      >
+                        <Check size={12} className="stroke-[3px]" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          cancelEditTags();
+                        }}
+                        className="rounded-full p-0.5 text-on-surface-variant hover:bg-surface-container-low"
+                        aria-label={`取消编辑 ${stock.name} 标签`}
+                      >
+                        <X size={12} className="stroke-[3px]" />
+                      </button>
+                    </div>
+                  )}
                   {(stock.groupIds ?? [activeGroup?.id].filter(Boolean) as string[]).map((groupId) => (
                     <span key={groupId} className="inline-flex items-center gap-1.5 rounded-full bg-surface-container-low px-2.5 py-1 text-xs font-black text-on-surface-variant">
                       {groupNameById[groupId] ?? groupId}

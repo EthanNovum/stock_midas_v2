@@ -49,7 +49,7 @@ export default function App() {
       case 'settings':
         return <Settings />;
       case 'reports':
-        return <Reports stockFilter={reportStockFilter} onClearStockFilter={() => setReportStockFilter(null)} />;
+        return <Reports stockFilter={reportStockFilter} onClearStockFilter={() => setReportStockFilter(null)} onOpenStockDetail={openStockDetail} />;
       default:
         return <Dashboard />;
     }
