@@ -2,8 +2,6 @@
 
 Midas 股票研究终端后端，技术栈为 FastAPI + sqlite3 + Pydantic。
 
-test
-
 ## 运行
 
 ```bash
